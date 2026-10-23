@@ -1,12 +1,15 @@
 {
   "name": "tizenbrew-runtime-identity",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "A bounded runtime identity snapshot from TizenBrew's existing Node service.",
+  "description": "A runtime identity snapshot and optional fixed identity check from TizenBrew's Node service.",
   "appName": "Runtime Identity",
   "packageType": "app",
   "appPath": "app/index.html",
   "serviceFile": "service.js",
   "keys": [],
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "scripts": {
+    "test": "node tests/identity-check.contract.js"
+  }
 }

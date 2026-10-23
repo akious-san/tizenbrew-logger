@@ -4,10 +4,12 @@
 
     var MODULE_ID = 'tizenbrew-runtime-identity';
     var REPORT_PATH = '/v1/report';
+    var CHECK_PATH = '/v1/id-check';
     var PORT = 18765;
     var MAX_REPORT_BYTES = 16384;
     var runtime = typeof process === 'undefined' ? {} : process;
     var platform = typeof tizen === 'undefined' ? {} : tizen;
+    var timers = require('timers');
 
     var fields = {
         nodeVersion: field('node.version', 'Node version', 'process.version', 'string'),
@@ -153,6 +155,183 @@
         });
     }
 
+    // The fixed settings are composed here; HTTP input never selects a program.
+    var identitySettings = Object.freeze({
+        file: '/usr/bin/id',
+        args: Object.freeze([]),
+        timeoutMs: 3000,
+        maxOutputBytesPerStream: 4096
+    });
+
+    function createIdentityCheck(settings) {
+        var state = Object.freeze({ status: 'NotRun' });
+
+        function running(attempt) {
+            return state === attempt && attempt.phase === 'Running';
+        }
+
+        function captured(stream) {
+            return Object.freeze({
+                bytes: stream.bytes,
+                text: Buffer.concat(stream.chunks, stream.bytes).toString('utf8')
+            });
+        }
+
+        function complete(attempt, status, exit, termination, reasonCode) {
+            if (state !== attempt || (attempt.phase !== 'Running' && attempt.phase !== 'Stopping')) {
+                return;
+            }
+            attempt.phase = 'Completed';
+            if (attempt.timer) {
+                timers.clearTimeout(attempt.timer);
+            }
+            var outcome = {
+                status: status,
+                startedAtUtc: attempt.startedAtUtc,
+                completedAtUtc: new Date().toISOString(),
+                stdout: captured(attempt.stdout),
+                stderr: captured(attempt.stderr),
+                exit: Object.freeze(exit),
+                termination: Object.freeze(termination)
+            };
+            if (reasonCode) {
+                outcome.reasonCode = reasonCode;
+            }
+            state = Object.freeze(outcome);
+        }
+
+        function stop(attempt, status, reasonCode) {
+            if (!running(attempt)) {
+                return;
+            }
+            // Mark stopping before kill: late/synchronous child events cannot replace this outcome.
+            attempt.phase = 'Stopping';
+            var termination = { status: 'RequestFailed', signal: 'SIGKILL' };
+            try {
+                if (attempt.child && attempt.child.kill('SIGKILL')) {
+                    termination.status = 'Requested';
+                }
+            } catch (error) {
+                // A signal request failure is evidence, not proof that the child exited.
+            }
+            complete(attempt, status, { status: 'NotObserved' }, termination, reasonCode);
+            ['stdout', 'stderr'].forEach(function (name) {
+                var stream = attempt.child && attempt.child[name];
+                if (stream && typeof stream.destroy === 'function') {
+                    try { stream.destroy(); } catch (error) { /* Result already records the stop. */ }
+                }
+            });
+        }
+
+        function startFailure(attempt, error) {
+            if (!running(attempt)) {
+                return;
+            }
+            var code = error && error.code;
+            var status = 'Failed';
+            var reason = 'ProcessStartFailed';
+            if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'MODULE_NOT_FOUND') {
+                status = 'Unavailable';
+                reason = 'ExecutableOrRuntimeUnavailable';
+            } else if (code === 'EACCES' || code === 'EPERM') {
+                status = 'Denied';
+                reason = 'ExecutionDenied';
+            }
+            complete(attempt, status, { status: 'NotObserved' }, { status: 'NotRequested' }, reason);
+        }
+
+        function capture(attempt, name, chunk) {
+            if (!running(attempt)) {
+                return;
+            }
+            if (!Buffer.isBuffer(chunk)) {
+                stop(attempt, 'Failed', 'UnexpectedOutput');
+                return;
+            }
+            var stream = attempt[name];
+            var remaining = settings.maxOutputBytesPerStream - stream.bytes;
+            var retained = Math.min(chunk.length, remaining);
+            if (retained > 0) {
+                stream.chunks.push(chunk.slice(0, retained));
+                stream.bytes += retained;
+            }
+            if (chunk.length > remaining) {
+                stop(attempt, 'OutputLimitExceeded', 'OutputLimitExceeded');
+            }
+        }
+
+        function read() {
+            var result = state;
+            if (state.phase === 'Running' || state.phase === 'Stopping') {
+                result = Object.freeze({ status: 'Running', startedAtUtc: state.startedAtUtc });
+            }
+            return Object.freeze({
+                moduleId: MODULE_ID,
+                schemaVersion: 1,
+                checkId: 'fixed-posix-id',
+                command: settings,
+                result: result
+            });
+        }
+
+        function start() {
+            if (state.status !== 'NotRun') {
+                return read();
+            }
+            var attempt = {
+                phase: 'Running',
+                startedAtUtc: new Date().toISOString(),
+                stdout: { bytes: 0, chunks: [] },
+                stderr: { bytes: 0, chunks: [] }
+            };
+            state = attempt;
+            var childProcess;
+            try {
+                childProcess = require('child_process');
+                if (!childProcess || typeof childProcess.spawn !== 'function') {
+                    complete(attempt, 'Unavailable', { status: 'NotObserved' },
+                        { status: 'NotRequested' }, 'SubprocessApiUnavailable');
+                    return read();
+                }
+                attempt.child = childProcess.spawn(settings.file, settings.args.slice(), {
+                    stdio: ['ignore', 'pipe', 'pipe']
+                });
+            } catch (error) {
+                startFailure(attempt, error);
+                return read();
+            }
+            var child = attempt.child;
+            child.on('error', function (error) { startFailure(attempt, error); });
+            child.on('close', function (code, signal) {
+                if (!running(attempt)) {
+                    return;
+                }
+                var exit = { status: 'NotObserved' };
+                if (typeof code === 'number' && isFinite(code) && Math.floor(code) === code) {
+                    exit = { status: 'Observed', kind: 'Code', value: code };
+                } else if (typeof signal === 'string' && /^[A-Z0-9]{1,32}$/.test(signal)) {
+                    exit = { status: 'Observed', kind: 'Signal', value: signal };
+                }
+                complete(attempt, exit.kind === 'Code' && exit.value === 0 ? 'Succeeded' : 'Failed',
+                    exit, { status: 'NotRequested' });
+            });
+            if (!child.stdout || !child.stderr || typeof child.stdout.on !== 'function' ||
+                    typeof child.stderr.on !== 'function') {
+                stop(attempt, 'Failed', 'OutputStreamsUnavailable');
+                return read();
+            }
+            ['stdout', 'stderr'].forEach(function (name) {
+                child[name].on('data', function (chunk) { capture(attempt, name, chunk); });
+                child[name].on('error', function () { stop(attempt, 'Failed', 'OutputReadFailed'); });
+            });
+            attempt.timer = timers.setTimeout(function () { stop(attempt, 'TimedOut', 'DeadlineExceeded'); }, settings.timeoutMs);
+            return read();
+        }
+
+        return Object.freeze({ read: read, start: start });
+    }
+
+    var identityCheck = createIdentityCheck(identitySettings);
     var report = collectSnapshot();
     var responseBody = JSON.stringify(report);
     if (Buffer.byteLength(responseBody, 'utf8') > MAX_REPORT_BYTES) {
@@ -188,13 +367,34 @@
             response.setHeader('Access-Control-Allow-Origin', origin);
             response.setHeader('Vary', 'Origin');
         }
-        if (request.method !== 'GET') {
-            response.setHeader('Allow', 'GET');
-            reply(response, 405, '{"error":"MethodNotAllowed"}');
+        if (request.url === CHECK_PATH) {
+            if (request.method !== 'GET' && request.method !== 'POST') {
+                response.setHeader('Allow', 'GET, POST');
+                reply(response, 405, '{"error":"MethodNotAllowed"}');
+                return;
+            }
+            if (request.method === 'POST' && typeof origin === 'undefined') {
+                reply(response, 403, '{"error":"OriginRequired"}');
+                return;
+            }
+            if (request.method === 'POST' &&
+                    (typeof request.headers['transfer-encoding'] !== 'undefined' ||
+                    (typeof request.headers['content-length'] !== 'undefined' && request.headers['content-length'] !== '0'))) {
+                reply(response, 400, '{"error":"BodyNotAccepted"}');
+                return;
+            }
+            var check = request.method === 'POST' ? identityCheck.start() : identityCheck.read();
+            reply(response, check.result.status === 'Running' && request.method === 'POST' ? 202 : 200,
+                JSON.stringify(check));
             return;
         }
         if (request.url !== REPORT_PATH) {
             reply(response, 404, '{"error":"NotFound"}');
+            return;
+        }
+        if (request.method !== 'GET') {
+            response.setHeader('Allow', 'GET');
+            reply(response, 405, '{"error":"MethodNotAllowed"}');
             return;
         }
         reply(response, 200, responseBody);

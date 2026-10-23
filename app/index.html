@@ -11,7 +11,7 @@
         h1 { margin: 0 0 12px; font-size: 44px; }
         p { margin: 10px 0 20px; line-height: 1.4; }
         .muted { color: #bbc8d0; }
-        button { padding: 12px 28px; margin-bottom: 16px; font: inherit; color: #101820; background: #b1ecdf; border: 3px solid transparent; border-radius: 6px; }
+        button { padding: 12px 28px; margin: 0 20px 16px 0; font: inherit; color: #101820; background: #b1ecdf; border: 3px solid transparent; border-radius: 6px; }
         button:focus { outline: 4px solid #ffffff; outline-offset: 4px; }
         button:disabled { background: #738982; }
         #status { min-height: 34px; }
@@ -25,6 +25,10 @@
         .unavailable { color: #e3cc91; }
         .error { color: #f3b3b3; }
         .note { font-size: 20px; color: #bbc8d0; }
+        h2 { margin: 16px 0 8px; font-size: 28px; }
+        h3 { margin: 12px 0 6px; font-size: 22px; }
+        pre { margin: 0 0 16px; padding: 12px; background: #192935; font: 20px monospace; white-space: pre-wrap; word-wrap: break-word; }
+        section { border-top: 1px solid #3a4a55; border-bottom: 1px solid #3a4a55; margin: 12px 0 20px; }
     </style>
 </head>
 <body>
@@ -32,13 +36,25 @@
         <h1>Runtime Identity</h1>
         <p class="muted">The account and runtime used by TizenBrew's background service.</p>
         <button id="refresh" type="button">Refresh report</button>
+        <button id="run-check" type="button" disabled>Run identity check</button>
+        <section aria-labelledby="check-heading">
+            <h2 id="check-heading">Fixed identity check</h2>
+            <p id="check-status" role="status" aria-live="polite">Waiting to read the check state.</p>
+            <p id="check-detail" class="note"></p>
+            <div id="check-output" hidden>
+                <h3>Standard output</h3>
+                <pre id="stdout"></pre>
+                <h3>Standard error</h3>
+                <pre id="stderr"></pre>
+            </div>
+        </section>
         <p id="status" role="status" aria-live="polite">Waiting to read the report.</p>
         <p id="timestamp" class="note"></p>
         <table id="report-table" hidden>
             <thead><tr><th scope="col">Evidence</th><th scope="col">Status</th><th scope="col">Observed value or reason</th></tr></thead>
             <tbody id="observations"></tbody>
         </table>
-        <p class="note">UID and GID describe the service process. Permission to run commands or change protected system files is not measured here.</p>
+        <p class="note">The snapshot describes the service process. The optional check measures only this invocation of /usr/bin/id. Access to protected system files is not measured.</p>
     </main>
     <script src="main.js"></script>
 </body>
