@@ -2,7 +2,15 @@
 
 A TizenBrew application module with a runtime identity report, a fixed identity check, and an optional owner-account shell console.
 
-Status: the user supplied photographs showing the runtime report and version 0.2.0's fixed `/usr/bin/id` check succeeding on the TV as owner (UID 5001, GID 100). Version 0.3.0 adds the owner-account shell; the shell has not been run on the TV during this implementation.
+Status: the user supplied photographs showing the runtime report and version 0.2.0's fixed `/usr/bin/id` check succeeding on the TV as owner (UID 5001, GID 100). Version 0.3.1 adds the fixed permission-check button to the owner shell. The agent has not executed the shell or these checks on the TV.
+
+## Permission check button (0.3.1)
+
+After Start shell, Run permission checks submits one fixed read-only script through the existing shell input path. It reports identity, capabilities, the shell security label, relevant mounts, directory/file modes, reported write access, four-byte library reads, and up to twenty library mapping lines each for the shell and its parent service. Its three library targets are `/usr/lib/libCLogger.so`, `/usr/lib/libvoltKPIBridge.so`, and `/usr/lib/libvoltEngine.so.1.22.4`.
+
+The button requires a fresh Running/Ready session with `nextInputSequence: 1`, `lastInput: None`, and no unresolved input request. This first-input rule prevents the script from entering an earlier command's unfinished quote/heredoc or foreground stdin reader. If commands were already sent, Stop shell and Start shell provide a new session for the checks. The button is independent of the command editor and preserves its draft. A click sends the script once. Refresh, polling, loading, and recovery never submit it. A recovery read must match the existing session, sequence, and exact preset text before acknowledging receipt. Receipt is not a completed or successful permission check; the output has section labels and an explicit finished marker, and failures remain in standard error.
+
+The script stays within the existing 4096-byte input limit, uses absolute utility paths, and runs inside a subshell so its temporary loop variable and relaxed error handling do not change the parent shell's variables or options. It does not change mounts, permissions, labels, library contents, or firmware. The only output redirection is the four-byte read into `/dev/null`. Write checks query access without attempting writes. The existing `service.js` and its forty prepared contract cases are reused without changes; this UI addition is reviewed statically and is not executed during preparation.
 
 ## Owner shell contract (0.3.0)
 
@@ -48,7 +56,7 @@ Checked against public release sources on 2026-10-22, after the user clarified t
 | --- | --- | --- |
 | TizenBrew Installer | `1.1.3` | Installs TV application packages; its repository installation path fetches the selected repository's latest release dynamically. |
 | TizenBrew TV app | `2.0.5` | The currently published app release and the pinned module-loader contract used by these sources. |
-| Diagnostic module | `0.3.0` | Adds an explicit owner-account shell console; this version does not track the installer's number. |
+| Diagnostic module | `0.3.1` | Adds the fixed read-only permission-check button; this version does not track the installer's number. |
 | TV platform baseline | Tizen `3.0`, Node `4.4.3` generation | The existing device record and compatibility baseline preserved by the module's syntax and API choices. |
 
 Using Installer 1.1.3 to install/update TizenBrew currently resolves to the 2.0.5 TV application release. That selection can change when the app publishes another release. The installer installs application packages; it does not update the TV's Tizen operating system. A TV OS update is not a prerequisite established by the inspected app manifest, which declares a minimum platform version of 3.0.
@@ -111,11 +119,13 @@ The folder and accompanying ZIP are source artifacts, not signed WGT installers.
 
 The inspected TizenBrew loader obtains module metadata and service source through jsDelivr. The user's repository is `akious-san/tizenbrew-logger`; it must remain publicly readable for this delivery path. The package.json `private` flag only prevents npm publication and is independent of GitHub visibility.
 
-Version 0.3.0 uses the GitHub tag `v0.3.0` for a stable module reference. The TV fetches that tag rather than uncommitted files on the PC.
+Version 0.3.1 uses the GitHub tag `v0.3.1` for a stable module reference. The TV fetches that tag rather than uncommitted files on the PC.
 
-In TizenBrew's Module Manager, remove the old module entry and add a GitHub module using `akious-san/tizenbrew-logger@v0.3.0` (the UI adds `gh/`). A new tag avoids reusing previously fetched branch contents. Restart the TV fully before opening the new entry: TizenBrew can retain the old service instance and loopback listener after merely leaving a page. There is no need to reinstall TizenBrew or update firmware for this module source change.
+In TizenBrew's Module Manager, remove the old module entry and add a GitHub module using `akious-san/tizenbrew-logger@v0.3.1` (the UI adds `gh/`). A new tag avoids reusing previously fetched branch contents. Restart the TV fully before opening the new entry: TizenBrew can retain the old service instance and loopback listener after merely leaving a page. There is no need to reinstall TizenBrew or update firmware for this module source change.
 
 Open Runtime Identity. Choose Start shell, enter a command, then Send command. Each command is sent once to the same running shell. Stop shell requests session termination. Refresh shell reads state and output. For example, entering `pwd` asks the shell to print its working directory; entering `cd /tmp` and then `pwd` uses that directory in the same session. These are usage examples, not commands executed by the agent. Publishing the module does not start a shell.
+
+For the fixed diagnostics, choose Start shell and then Run permission checks before sending any other command. The editor can contain an unsent draft; the button leaves it intact. After earlier input, Stop shell and Start shell enable the button in a fresh session. Read the labelled results in standard output and any failures in standard error. FINISHED indicates the script reached its end, not that access was granted or that all queries succeeded.
 
 Use the remote's Left/Right buttons to move between enabled controls. Down from Send focuses standard output; arrows scroll inside it, Left/Right switch output streams, and Back/Escape returns to controls. New output follows the bottom while it is already in view; scrolling up keeps the reader's position. Up/Down otherwise remain available for scrolling the report.
 

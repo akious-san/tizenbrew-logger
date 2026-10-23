@@ -1,6 +1,6 @@
 {
   "name": "tizenbrew-runtime-identity",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "A runtime identity report and explicit owner-account shell console in TizenBrew's Node service.",
   "appName": "Runtime Identity",

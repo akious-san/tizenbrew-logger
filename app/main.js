@@ -7,6 +7,51 @@
     var MAX_REPORT_BYTES = 16384;
     var MAX_CHECK_BYTES = 65536;
     var MAX_SHELL_BYTES = 262144;
+    var permissionChecks = Object.freeze({
+        source: 'PermissionChecks',
+        command: [
+            "(",
+            "set +e",
+            "command printf '=== IDENTITY AND RESTRICTIONS ===\\n'",
+            "command /usr/bin/id",
+            "command pwd",
+            "command /usr/bin/grep -E '^(Name|Uid|Gid|Groups|Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):' /proc/$$/status",
+            "command /usr/bin/cat /proc/$$/attr/current",
+            "command printf '\\n=== MOUNTS AND DIRECTORIES ===\\n'",
+            "command /usr/bin/grep -E ' / | /(usr|lib|opt|mnt/systemrw|home|tmp)(/| )' /proc/$$/mounts",
+            "command /usr/bin/ls -ld /lib /usr/lib /opt /mnt/systemrw",
+            "command printf '\\n=== LIBRARY ACCESS ===\\n'",
+            "for p in /usr/lib/libCLogger.so /usr/lib/libvoltKPIBridge.so /usr/lib/libvoltEngine.so.1.22.4",
+            "do",
+            "    command printf '\\n%s\\n' \"$p\"",
+            "    command /usr/bin/ls -l \"$p\"",
+            "    if command [ -w \"$p\" ]",
+            "    then",
+            "        command printf 'WRITE_CHECK: YES\\n'",
+            "    else",
+            "        command printf 'WRITE_CHECK: NO OR UNAVAILABLE\\n'",
+            "    fi",
+            "    if command /usr/bin/head -c 4 \"$p\" > /dev/null",
+            "    then",
+            "        command printf 'READ: OK\\n'",
+            "    else",
+            "        command printf 'READ: FAILED (see standard error)\\n'",
+            "    fi",
+            "done",
+            "if command [ -w /usr/lib ]",
+            "then",
+            "    command printf '\\n/usr/lib DIRECTORY_WRITE_CHECK: YES\\n'",
+            "else",
+            "    command printf '\\n/usr/lib DIRECTORY_WRITE_CHECK: NO OR UNAVAILABLE\\n'",
+            "fi",
+            "command printf '\\n=== SHELL LIBRARY MAPPINGS (first 20 lines) ===\\n'",
+            "command /usr/bin/grep '\\.so' /proc/$$/maps | command /usr/bin/head -n 20",
+            "command printf '\\n=== PARENT SERVICE LIBRARY MAPPINGS (first 20 lines) ===\\n'",
+            "command /usr/bin/grep '\\.so' /proc/$PPID/maps | command /usr/bin/head -n 20",
+            "command printf '\\n=== PERMISSION CHECKS FINISHED ===\\n'",
+            ")"
+        ].join('\n')
+    });
     var expectedFields = {
         'node.version': 'string',
         'node.platform': 'string',
@@ -36,6 +81,7 @@
     var shellStart = document.getElementById('shell-start');
     var shellCommand = document.getElementById('shell-command');
     var shellSend = document.getElementById('shell-send');
+    var shellPermissions = document.getElementById('shell-permissions');
     var shellStop = document.getElementById('shell-stop');
     var shellRefresh = document.getElementById('shell-refresh');
     var shellStatus = document.getElementById('shell-status');
@@ -355,6 +401,11 @@
             (session.status === 'Stopping' && session.termination.status === 'RequestFailed'));
     }
 
+    function shellCanRunChecks(session) {
+        return session.status === 'Running' && session.inputStatus === 'Ready' &&
+            session.nextInputSequence === 1 && session.lastInput.status === 'None';
+    }
+
     function updateShellControls() {
         var ready = shellPage.status === 'Active' && shellView.status === 'Ready' && shellSnapshot.status === 'Observed';
         var sessionStatus = shellSnapshot.status === 'Observed' ? shellSnapshot.value.session.status : 'Unknown';
@@ -362,6 +413,8 @@
         shellSend.disabled = !ready || sessionStatus !== 'Running' ||
             shellSnapshot.value.session.inputStatus !== 'Ready' ||
             shellInput.status === 'Awaiting' || !validShellCommand(shellCommand.value);
+        shellPermissions.disabled = !ready || !shellCanRunChecks(shellSnapshot.value.session) ||
+            shellInput.status === 'Awaiting';
         shellStop.disabled = !ready || !shellCanStop(shellSnapshot.value.session);
         shellRefresh.disabled = shellView.status === 'Pending' || shellPage.status !== 'Active';
         shellCommand.disabled = shellSnapshot.status !== 'Observed' || sessionStatus !== 'Running';
@@ -437,40 +490,41 @@
 
     function reconcileShellInput(envelope) {
         if (shellInput.status !== 'Awaiting') {
-            return '';
+            return { status: 'NoInput', message: '' };
         }
         var input = shellInput;
         var session = envelope.session;
-        if (session.id !== input.sessionId) {
+        function resolved(status, message) {
             shellInput = { status: 'None' };
-            return 'The session changed; the typed command was retained.';
+            return { status: status, source: input.source, message: message };
+        }
+        if (session.id !== input.sessionId) {
+            return resolved('SessionChanged', 'The session changed; the typed command was retained.');
         }
         if (session.reasonCode === 'InputWriteFailed' || envelope.outcome.reasonCode === 'InputWriteFailed') {
-            shellInput = { status: 'None' };
-            return 'Command write failed; the typed command was retained.';
+            return resolved('WriteFailed', 'Command write failed; the typed command was retained.');
         }
         if (envelope.outcome.status === 'Rejected') {
-            shellInput = { status: 'None' };
-            return 'The typed command was retained.';
+            return resolved('Rejected', 'The typed command was retained.');
         }
         if (session.lastInput.status === 'Submitted' && session.lastInput.sequence === input.sequence &&
                 session.lastInput.command === input.command) {
-            shellInput = { status: 'None' };
-            if (commandRevision === input.revision && shellCommand.value === input.command) {
+            if (input.source === 'Editor' && commandRevision === input.revision && shellCommand.value === input.command) {
                 shellCommand.value = '';
                 commandRevision += 1;
             }
-            return 'Command received; completion is not confirmed.';
+            return resolved('Received', input.source === 'PermissionChecks' ?
+                'Permission checks received. Results appear below; receipt does not confirm completion.' :
+                'Command received; completion is not confirmed.');
         }
         if (session.nextInputSequence === input.sequence) {
-            shellInput = { status: 'None' };
-            return 'Input was not accepted; the typed command was retained.';
+            return resolved('NotAccepted', 'Input was not accepted; the typed command was retained.');
         }
         if (session.nextInputSequence > input.sequence) {
-            shellInput = { status: 'None' };
-            return 'Another input was accepted. The typed command was retained; nothing was resent.';
+            return resolved('ConflictingInput', 'Another input was accepted. The typed command was retained; nothing was resent.');
         }
-        return 'Input delivery could not be confirmed from this sequence; the typed command was retained.';
+        return { status: 'Unresolved', source: input.source,
+            message: 'Input delivery could not be confirmed from this sequence; the typed command was retained.' };
     }
 
     function shellOutcomeMessage(outcome, session) {
@@ -495,7 +549,7 @@
         return '';
     }
 
-    function loadShell(action) {
+    function loadShell(action, selection) {
         if (shellView.status === 'Pending' || !shellVisible()) {
             return;
         }
@@ -515,7 +569,12 @@
                 if (session.inputStatus !== 'Ready' || shellInput.status === 'Awaiting') {
                     return;
                 }
-                var command = shellCommand.value;
+                var selected = selection || { source: 'Editor', command: shellCommand.value };
+                if (selected.source === 'PermissionChecks' && !shellCanRunChecks(session)) {
+                    shellStatus.textContent = 'Start a new shell session to run permission checks.';
+                    return;
+                }
+                var command = selected.command;
                 if (!validShellCommand(command)) {
                     shellStatus.textContent = 'Enter a nonblank command of at most 4096 UTF-8 bytes with no NUL characters.';
                     return;
@@ -524,7 +583,7 @@
                 payload.command = command;
                 shellInput = {
                     status: 'Awaiting', sessionId: session.id, sequence: payload.sequence,
-                    command: command, revision: commandRevision
+                    source: selected.source, command: command, revision: commandRevision
                 };
             }
         }
@@ -533,7 +592,8 @@
         shellView = pending;
         updateShellControls();
         if (action) {
-            shellStatus.textContent = action === 'input' ? 'Sending command...' :
+            shellStatus.textContent = action === 'input' ?
+                (shellInput.source === 'PermissionChecks' ? 'Sending read-only permission checks...' : 'Sending command...') :
                 (action === 'start' ? 'Starting shell...' : 'Requesting stop...');
         }
         requestJson(action ? 'POST' : 'GET', SHELL_URL, MAX_SHELL_BYTES, function (outcome) {
@@ -548,7 +608,7 @@
                     'Delivery is unknown. Refresh shell reads state; no action will be retried automatically.' :
                     'Refresh shell reads state. Existing output is the last observed snapshot.';
                 updateShellControls();
-                if (shellVisible() && (pending.focus === shellStart || pending.focus === shellSend || pending.focus === shellStop ||
+                if (shellVisible() && (pending.focus === shellStart || pending.focus === shellSend || pending.focus === shellPermissions || pending.focus === shellStop ||
                         (pending.focus === shellStatus && document.activeElement === shellStatus))) {
                     shellRefresh.focus();
                 }
@@ -558,11 +618,20 @@
             var envelope = outcome.value;
             shellSnapshot = { status: 'Observed', value: envelope };
             shellView = { status: 'Ready' };
-            var inputMessage = reconcileShellInput(envelope);
+            var receipt = reconcileShellInput(envelope);
+            var inputMessage = receipt.message;
             renderShell(envelope, inputMessage && envelope.outcome.status === 'Rejected' ?
                 shellOutcomeMessage(envelope.outcome, envelope.session) + ' ' + inputMessage :
                 (inputMessage || shellOutcomeMessage(envelope.outcome, envelope.session)));
-            if (shellVisible() && action && (pending.focus === shellStart || pending.focus === shellSend) && !shellCommand.disabled) {
+            if (shellVisible() && receipt.status === 'Received' && receipt.source === 'PermissionChecks' &&
+                    (document.activeElement === document.body || document.activeElement === shellPermissions ||
+                    document.activeElement === shellRefresh || document.activeElement === shellStatus)) {
+                shellStdout.focus();
+            } else if (shellVisible() && action && pending.focus === shellPermissions &&
+                    (document.activeElement === document.body || document.activeElement === shellPermissions ||
+                    document.activeElement === shellStatus)) {
+                shellRefresh.focus();
+            } else if (shellVisible() && action && (pending.focus === shellStart || pending.focus === shellSend) && !shellCommand.disabled) {
                 shellCommand.focus();
             } else if (shellVisible() && action && pending.focus === shellStop) {
                 shellRefresh.focus();
@@ -724,6 +793,7 @@
     });
     shellStart.addEventListener('click', function () { loadShell('start'); });
     shellSend.addEventListener('click', function () { loadShell('input'); });
+    shellPermissions.addEventListener('click', function () { loadShell('input', permissionChecks); });
     shellStop.addEventListener('click', function () { loadShell('stop'); });
     shellRefresh.addEventListener('click', function () { loadShell(); });
     shellCommand.addEventListener('input', function () {
@@ -772,12 +842,12 @@
             // Ordinary Enter and arrows belong to the editor, including vertical scroll.
             return;
         }
-        var controls = [shellStart, shellStop, shellRefresh, shellSend, shellStdout, shellStderr, refresh, runCheck];
+        var controls = [shellStart, shellStop, shellRefresh, shellPermissions, shellSend, shellStdout, shellStderr, refresh, runCheck];
         var index = controls.indexOf(active);
         if (index < 0) {
             return;
         }
-        if (code === 40 && active === shellSend) {
+        if (code === 40 && (active === shellSend || active === shellPermissions)) {
             event.preventDefault();
             shellStdout.focus();
             return;

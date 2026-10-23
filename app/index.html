@@ -46,6 +46,8 @@
             <button id="shell-start" type="button" disabled>Start shell</button>
             <button id="shell-stop" type="button" disabled>Stop shell</button>
             <button id="shell-refresh" type="button">Refresh shell</button>
+            <button id="shell-permissions" type="button" disabled aria-describedby="shell-permissions-help">Run permission checks</button>
+            <p id="shell-permissions-help" class="note">Available at the start of a new shell session. Runs the fixed read-only checks; results appear below. Your typed command is kept.</p>
             <p id="shell-status" role="status" aria-live="polite" tabindex="-1">Waiting to read shell state. Nothing starts automatically.</p>
             <p id="shell-detail" class="note"></p>
             <label for="shell-command">Command</label>
