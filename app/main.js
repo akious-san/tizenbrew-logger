@@ -4,6 +4,7 @@
     var REPORT_URL = 'http://127.0.0.1:18765/v1/report';
     var CHECK_URL = 'http://127.0.0.1:18765/v1/id-check';
     var SHELL_URL = 'http://127.0.0.1:18765/v1/shell';
+    var PC_LINK_URL = 'http://127.0.0.1:18765/v1/pc-link';
     var MAX_REPORT_BYTES = 16384;
     var MAX_CHECK_BYTES = 65536;
     var MAX_SHELL_BYTES = 262144;
@@ -96,6 +97,15 @@
     var shellInput = { status: 'None' };
     var shellPage = { status: 'Active' };
     var commandRevision = 0;
+    var pcAddress = document.getElementById('pc-address');
+    var pcCode = document.getElementById('pc-code');
+    var pcPair = document.getElementById('pc-pair');
+    var pcDisconnect = document.getElementById('pc-disconnect');
+    var pcStatus = document.getElementById('pc-status');
+    var pcDetail = document.getElementById('pc-detail');
+    var pcView = { status: 'Idle' };
+    var pcSnapshot = { status: 'Unavailable' };
+    var pcPoll = { status: 'Idle' };
 
     function boundedString(value, maximum) {
         return typeof value === 'string' && value.length > 0 && value.length <= maximum;
@@ -647,6 +657,166 @@
         }, payload);
     }
 
+    function validPcAddress(value) {
+        if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/.test(value)) {
+            return false;
+        }
+        var parts = value.split('.').map(Number);
+        return parts.every(function (part) { return part <= 255; }) &&
+            (parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+            (parts[0] === 192 && parts[1] === 168));
+    }
+
+    function validPcLink(envelope) {
+        if (!envelope || envelope.moduleId !== 'tizenbrew-runtime-identity' || envelope.schemaVersion !== 1 ||
+                !envelope.pcLink || typeof envelope.pcLink !== 'object') {
+            return false;
+        }
+        var link = envelope.pcLink;
+        return ['Disabled', 'Pairing', 'Connected', 'Failed'].indexOf(link.status) >= 0 &&
+            !own.call(link, 'token') && !own.call(link, 'pairCode') &&
+            (!own.call(link, 'reasonCode') || validReason(link.reasonCode)) &&
+            (!own.call(link, 'pcAddress') || validPcAddress(link.pcAddress)) &&
+            (!own.call(link, 'expiresAtUtc') || validTimestamp(link.expiresAtUtc)) &&
+            (['Pairing', 'Connected'].indexOf(link.status) < 0 || validPcAddress(link.pcAddress)) &&
+            (link.status !== 'Connected' || validTimestamp(link.expiresAtUtc));
+    }
+
+    function updatePcControls() {
+        var ready = shellPage.status === 'Active' && pcView.status === 'Ready' && pcSnapshot.status === 'Observed';
+        var active = pcSnapshot.status === 'Observed' &&
+            ['Pairing', 'Connected'].indexOf(pcSnapshot.value.status) >= 0;
+        pcPair.disabled = !ready || active || !validPcAddress(pcAddress.value) || !/^[0-9]{8}$/.test(pcCode.value);
+        pcDisconnect.disabled = !ready || pcSnapshot.value.status === 'Disabled';
+        pcAddress.disabled = shellPage.status !== 'Active' || active || pcView.status === 'Pending';
+        pcCode.disabled = shellPage.status !== 'Active' || active || pcView.status === 'Pending';
+    }
+
+    function clearPcPoll() {
+        if (pcPoll.status === 'Scheduled') {
+            clearTimeout(pcPoll.timer);
+        }
+        pcPoll = { status: 'Idle' };
+    }
+
+    function schedulePcRead(recovery) {
+        clearPcPoll();
+        if (!shellVisible() || pcView.status === 'Pending' || (!recovery &&
+                (pcSnapshot.status !== 'Observed' || ['Pairing', 'Connected'].indexOf(pcSnapshot.value.status) < 0))) {
+            return;
+        }
+        var scheduled = { status: 'Scheduled' };
+        pcPoll = scheduled;
+        scheduled.timer = setTimeout(function () {
+            if (pcPoll !== scheduled) {
+                return;
+            }
+            pcPoll = { status: 'Idle' };
+            loadPcLink();
+        }, 1000);
+    }
+
+    function renderPcLink(link) {
+        if (link.status === 'Disabled') {
+            pcStatus.textContent = 'PC access is off.';
+            pcDetail.textContent = 'Start the PC broker, then enter its address and eight-digit pairing code.';
+        } else if (link.status === 'Pairing') {
+            pcStatus.textContent = 'Pairing with ' + link.pcAddress + '...';
+            pcDetail.textContent = 'No shell starts during pairing. Disconnect cancels this connection.';
+        } else if (link.status === 'Connected') {
+            pcStatus.textContent = 'PC connected: ' + link.pcAddress + '.';
+            pcDetail.textContent = 'Link expires at ' + link.expiresAtUtc + '. Disconnect stops PC access; the shell has its own Stop control.';
+        } else {
+            pcStatus.textContent = 'PC connection stopped' + (link.reasonCode ? ' (' + link.reasonCode + ').' : '.');
+            pcDetail.textContent = 'Requests are not retried. Pair again explicitly or choose Disconnect.';
+        }
+        updatePcControls();
+    }
+
+    function loadPcLink(action) {
+        if (!shellVisible() || pcView.status === 'Pending') {
+            return;
+        }
+        var payload;
+        if (action) {
+            if (pcView.status !== 'Ready' || pcSnapshot.status !== 'Observed') {
+                return;
+            }
+            if (action === 'enable') {
+                if (pcPair.disabled || !validPcAddress(pcAddress.value) || !/^[0-9]{8}$/.test(pcCode.value)) {
+                    return;
+                }
+                payload = { action: 'enable', pcAddress: pcAddress.value, pairCode: pcCode.value };
+            } else if (action === 'disable' && !pcDisconnect.disabled) {
+                payload = { action: 'disable' };
+            } else {
+                return;
+            }
+        }
+        clearPcPoll();
+        var pending = { status: 'Pending', action: action || 'read', focus: document.activeElement,
+            readFocus: { status: 'NotRequested' } };
+        if (!action && [pcPair, pcDisconnect, pcAddress, pcCode].indexOf(pending.focus) >= 0) {
+            pending.readFocus = { status: 'Parked' };
+            pcStatus.focus();
+        }
+        function restoreReadFocus() {
+            if (!shellVisible() || pending.readFocus.status !== 'Parked' || document.activeElement !== pcStatus) {
+                return false;
+            }
+            var targets = [pending.focus, pcDisconnect, pcPair, pcAddress, shellRefresh, refresh, shellStdout];
+            for (var index = 0; index < targets.length; index += 1) {
+                if (!targets[index].disabled) {
+                    pending.readFocus = { status: 'Restored' };
+                    targets[index].focus();
+                    return true;
+                }
+            }
+            return false;
+        }
+        pcView = pending;
+        updatePcControls();
+        if (action) {
+            pcStatus.textContent = action === 'enable' ? 'Requesting PC pairing...' : 'Disconnecting PC access...';
+        }
+        requestJson(action ? 'POST' : 'GET', PC_LINK_URL, 4096, function (outcome) {
+            if (pcView !== pending) {
+                return;
+            }
+            var focusOwned = document.activeElement === pending.focus || document.activeElement === document.body ||
+                document.activeElement === pcStatus;
+            if (outcome.status !== 'Received' || !validPcLink(outcome.value)) {
+                pcView = { status: 'Unavailable' };
+                pcStatus.textContent = 'PC link state unavailable. ' + (outcome.message || 'Its format did not match this module.');
+                pcDetail.textContent = 'Refresh shell reads link state. Pairing and disconnection are never retried automatically.';
+                updatePcControls();
+                if (restoreReadFocus()) {
+                    // Restore only while the read still owns its temporary focus target.
+                } else if (shellVisible() && action && focusOwned && !shellRefresh.disabled) {
+                    shellRefresh.focus();
+                }
+                schedulePcRead(!!action);
+                return;
+            }
+            pcSnapshot = { status: 'Observed', value: outcome.value.pcLink };
+            pcView = { status: 'Ready' };
+            if (action === 'enable') {
+                pcCode.value = '';
+            }
+            renderPcLink(pcSnapshot.value);
+            if (restoreReadFocus()) {
+                // A poll must not leave a disabled Pair/Disconnect control focused.
+            } else if (shellVisible() && action && focusOwned && !pcDisconnect.disabled) {
+                pcDisconnect.focus();
+            } else if (shellVisible() && document.activeElement === pcStatus && !pcAddress.disabled) {
+                pcAddress.focus();
+            } else if (shellVisible() && action === 'disable' && focusOwned && !pcAddress.disabled) {
+                pcAddress.focus();
+            }
+            schedulePcRead(false);
+        }, payload);
+    }
+
     function renderCheck(result) {
         runCheck.disabled = result.status !== 'NotRun';
         checkOutput.hidden = result.status === 'NotRun' || result.status === 'Running';
@@ -785,6 +955,7 @@
     refresh.addEventListener('click', function () {
         loadReport();
         loadCheck('GET', 0);
+        loadPcLink();
     });
     runCheck.addEventListener('click', function () {
         if (checkView.status === 'Ready' && checkView.result.status === 'NotRun') {
@@ -795,7 +966,11 @@
     shellSend.addEventListener('click', function () { loadShell('input'); });
     shellPermissions.addEventListener('click', function () { loadShell('input', permissionChecks); });
     shellStop.addEventListener('click', function () { loadShell('stop'); });
-    shellRefresh.addEventListener('click', function () { loadShell(); });
+    shellRefresh.addEventListener('click', function () { loadShell(); loadPcLink(); });
+    pcPair.addEventListener('click', function () { loadPcLink('enable'); });
+    pcDisconnect.addEventListener('click', function () { loadPcLink('disable'); });
+    pcAddress.addEventListener('input', updatePcControls);
+    pcCode.addEventListener('input', updatePcControls);
     shellCommand.addEventListener('input', function () {
         commandRevision += 1;
         updateShellControls();
@@ -803,6 +978,29 @@
     document.addEventListener('keydown', function (event) {
         var code = event.keyCode;
         var active = document.activeElement;
+        if (active === pcAddress || active === pcCode) {
+            if (code === 13) {
+                event.preventDefault();
+                if (active === pcAddress && !pcCode.disabled) {
+                    pcCode.focus();
+                } else if (!pcPair.disabled) {
+                    pcPair.focus();
+                }
+            } else if (code === 27 || code === 461 || code === 10009) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!pcPair.disabled) {
+                    pcPair.focus();
+                } else if (!pcDisconnect.disabled) {
+                    pcDisconnect.focus();
+                } else if (!shellRefresh.disabled) {
+                    shellRefresh.focus();
+                } else {
+                    pcStatus.focus();
+                }
+            }
+            return;
+        }
         if (active === shellStdout || active === shellStderr) {
             var outputTarget;
             if (code === 37 || code === 39) {
@@ -842,9 +1040,31 @@
             // Ordinary Enter and arrows belong to the editor, including vertical scroll.
             return;
         }
-        var controls = [shellStart, shellStop, shellRefresh, shellPermissions, shellSend, shellStdout, shellStderr, refresh, runCheck];
+        var controls = [pcPair, pcDisconnect, pcAddress, pcCode, shellStart, shellStop, shellRefresh,
+            shellPermissions, shellSend, shellStdout, shellStderr, refresh, runCheck];
         var index = controls.indexOf(active);
         if (index < 0) {
+            return;
+        }
+        if (code === 40 && (active === pcPair || active === pcDisconnect)) {
+            var shellTarget = !shellStart.disabled ? shellStart : shellRefresh;
+            if (!shellTarget.disabled) {
+                event.preventDefault();
+                shellTarget.focus();
+            }
+            return;
+        }
+        if (code === 38 && (active === pcPair || active === pcDisconnect) && !pcCode.disabled) {
+            event.preventDefault();
+            pcCode.focus();
+            return;
+        }
+        if (code === 38 && active === shellStart) {
+            var pcTarget = !pcPair.disabled ? pcPair : (!pcDisconnect.disabled ? pcDisconnect : pcAddress);
+            if (!pcTarget.disabled) {
+                event.preventDefault();
+                pcTarget.focus();
+            }
             return;
         }
         if (code === 40 && (active === shellSend || active === shellPermissions)) {
@@ -875,8 +1095,10 @@
     function leaveShellPage() {
         shellPage = { status: 'Left' };
         clearShellPoll();
+        clearPcPoll();
         // Keep the pending request owned until completion; returning cannot overlap it with another request.
         updateShellControls();
+        updatePcControls();
     }
     window.addEventListener('pagehide', leaveShellPage);
     window.addEventListener('beforeunload', leaveShellPage);
@@ -884,16 +1106,20 @@
         if (shellPage.status === 'Left') {
             shellPage = { status: 'Active' };
             loadShell();
+            loadPcLink();
         }
     });
     document.addEventListener('visibilitychange', function () {
         clearShellPoll();
+        clearPcPoll();
         if (shellVisible()) {
             loadShell();
+            loadPcLink();
         }
     });
     loadReport();
     loadCheck('GET', 0);
-    shellStatus.focus();
+    pcStatus.focus();
     loadShell();
+    loadPcLink();
 }());

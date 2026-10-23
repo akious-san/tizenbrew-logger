@@ -1,8 +1,43 @@
 # TizenBrew runtime identity
 
-A TizenBrew application module with a runtime identity report, a fixed identity check, and an optional owner-account shell console.
+A TizenBrew application module with a runtime identity report, a fixed identity check, an optional owner-account shell console, and explicit paired PC access.
 
-Status: the user supplied photographs showing the runtime report and version 0.2.0's fixed `/usr/bin/id` check succeeding on the TV as owner (UID 5001, GID 100). Version 0.3.1 adds the fixed permission-check button to the owner shell. The agent has not executed the shell or these checks on the TV.
+Status: user photographs establish the runtime report, identity check, persistent shell, and permission-check output as owner (UID 5001, GID 100). Version 0.4.0 adds paired PC access. Its on-TV pairing and PC-driven shell execution remain separate runtime outcomes until recorded explicitly.
+
+## PC access and logging (0.4.0)
+
+Keep the TV's Developer Mode Host PC IP at `127.0.0.1`, as required by TizenBrew's documented setup. That field is separate from the TV's LAN address. On the inspected TV, the SDB TCP port accepted connections but SDB could not establish a device session in this configuration, so no forward was created. The bundled TizenBrew service is also bound to TV loopback and supplies no existing PC shell proxy.
+
+The optional PC link reuses the existing shell protocol. After an explicit Pair PC action on the TV, the module makes outbound requests to one entered private IPv4 address on port 18766. It opens no TV LAN listener. Pairing never starts a shell or submits a command. The PC broker exposes the same shell protocol locally on `127.0.0.1:18765`; the PC-only controller records command intents, receipts, lifecycle changes, decoded output snapshots, and dropped-output evidence in JSONL.
+
+The PC tools require Node.js 24 or newer and use only its built-in modules. Start the broker from this repository, substituting the actual PC and TV LAN addresses:
+
+```powershell
+node tools/pc-link.mjs --pc-ip 192.168.1.245 --tv-ip 192.168.1.208
+```
+
+The broker displays an eight-digit pairing code valid for five minutes. It binds port 18766 only to the specified PC address, accepts pairing/jobs/results only from the specified TV address, and locks pairing after five incorrect codes. If Windows Firewall blocks the connection, any allowance should be limited to that PC port and TV address. No firewall rule is created by these tools.
+
+Update the module on the TV to 0.4.0 and restart its owning TizenBrew service so the newly published service source is actually loaded. In Runtime Identity, enter the PC's address and the displayed code, then choose Pair PC. The connected session uses an in-memory random capability and expires within fifteen minutes; after expiry, restart the broker and pair explicitly again. Disconnect PC cancels the relay but does not stop an existing shell. Closing the PC tools also leaves the shell under its existing idle/lifetime limits.
+
+This is a temporary private-LAN HTTP debugging connection. Traffic is not encrypted. Pair only on a trusted network: a paired PC can run commands with the application's permissions. Capability tokens are omitted from broker/controller logs; command text and captured output are intentionally recorded.
+
+From a second PC terminal in this repository:
+
+```powershell
+node tools/pc-shell.mjs status
+node tools/pc-shell.mjs start
+node tools/pc-shell.mjs send "id"
+node tools/pc-shell.mjs status
+node tools/pc-shell.mjs watch
+node tools/pc-shell.mjs stop
+```
+
+These are separately requested actions, not an automatic startup sequence. `start` attaches to an already-running shell rather than replacing it. `send` acknowledges pipe submission; it does not prove command completion. `watch` reads output until Ctrl+C and never sends input. Logs default to `pc-shell-logs/session.jsonl`; use `--log <path>` for another file. Broker logs are separate `broker-*.jsonl` files in the same ignored directory. The broker pairing code appears only in its startup display, not its structured activity log.
+
+If a POST's outcome becomes uncertain, the client performs recovery reads and never resends the action automatically. Durable unresolved intents block later mutations until reconciled. The explicit `--acknowledge-uncertain` option acknowledges any remaining uncertainty and permits only the newly requested action; it does not replay the old one. Reads remain available without that option. Do not edit or share a log containing unresolved intents as if it were a complete transcript.
+
+The TV API retains only 16 KiB per output stream and exposes decoded text plus byte counters. Logs preserve changed snapshots and report gaps, including output already dropped before attachment. They are not a byte-exact or necessarily complete transcript of all output. This connection adds no elevated identity, firmware writes, native-code loader, or startup persistence.
 
 ## Permission check button (0.3.1)
 
@@ -137,7 +172,7 @@ The inspected host serves application modules over local HTTP on port 8081, whic
 
 ## Validation record
 
-The earlier snapshot and fixed identity check have user-supplied on-TV evidence. This shell version uses static source review, diff/metadata/archive checks, and publication verification only. Forty synthetic service contract cases are supplied but have not been executed. No shell, command, application JavaScript, TV connection, or TV deployment is performed by the agent in this step. Publishing a package is not a passed shell integration test.
+User photographs supply the existing shell and permission-check runtime evidence. Version 0.4.0 has separate local synthetic contract suites for the original service, TV relay, PC broker and PC controller. The synthetic suites replace network/process boundaries with fakes and do not establish on-TV pairing, shell execution or firmware compatibility. Publication and PC listeners must likewise be reported separately from a completed TV connection. See the task's delivery record for actual test counts and live outcomes.
 
 ## Source references
 

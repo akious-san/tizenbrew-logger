@@ -6,6 +6,7 @@
     var REPORT_PATH = '/v1/report';
     var CHECK_PATH = '/v1/id-check';
     var SHELL_PATH = '/v1/shell';
+    var PC_LINK_PATH = '/v1/pc-link';
     var MAX_SHELL_BODY_BYTES = 32768;
     var PORT = 18765;
     var MAX_REPORT_BYTES = 16384;
@@ -681,6 +682,298 @@
     }
 
     var http = require('http');
+
+    // One optional outbound link delegates jobs to the existing loopback shell route.
+    function createPcLink() {
+        var state = { status: 'Disabled' };
+
+        function privateAddress(value) {
+            if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/.test(value)) {
+                return false;
+            }
+            var parts = value.split('.').map(Number);
+            return parts.every(function (part) { return part <= 255; }) &&
+                (parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+                (parts[0] === 192 && parts[1] === 168));
+        }
+
+        function current(attempt) {
+            return state === attempt && (attempt.status === 'Pairing' || attempt.status === 'Connected');
+        }
+
+        function abortRequest(pending) {
+            if (pending.client && typeof pending.client.abort === 'function') {
+                try { pending.client.abort(); } catch (error) { /* Cancellation is best effort. */ }
+            }
+            if (pending.response && typeof pending.response.destroy === 'function') {
+                try { pending.response.destroy(); } catch (error) { /* Cancellation is best effort. */ }
+            }
+        }
+
+        function cancel(attempt) {
+            ['wait', 'expiry'].forEach(function (name) {
+                if (attempt[name] && attempt[name].status === 'Scheduled') {
+                    timers.clearTimeout(attempt[name].timer);
+                }
+                attempt[name] = { status: 'None' };
+            });
+            if (attempt.request && attempt.request.status === 'Pending') {
+                var pending = attempt.request;
+                pending.status = 'Cancelled';
+                if (pending.deadline) {
+                    timers.clearTimeout(pending.deadline);
+                }
+                abortRequest(pending);
+            }
+            attempt.request = { status: 'None' };
+            delete attempt.token;
+        }
+
+        function fail(attempt, reason) {
+            if (!current(attempt)) {
+                return;
+            }
+            attempt.status = 'Failed';
+            attempt.reasonCode = reason;
+            cancel(attempt);
+        }
+
+        function read() {
+            var observed = { status: state.status };
+            ['reasonCode', 'pcAddress', 'expiresAtUtc'].forEach(function (name) {
+                if (Object.prototype.hasOwnProperty.call(state, name)) {
+                    observed[name] = state[name];
+                }
+            });
+            return { moduleId: MODULE_ID, schemaVersion: 1, pcLink: observed };
+        }
+
+        function jsonRequest(attempt, options, payload, callback) {
+            if (!current(attempt)) {
+                return;
+            }
+            if (attempt.request.status !== 'None') {
+                fail(attempt, 'ConcurrentRequest');
+                return;
+            }
+            var pending = { status: 'Pending' };
+            attempt.request = pending;
+            var body;
+            function finish(outcome) {
+                if (pending.status !== 'Pending' || !current(attempt)) {
+                    return;
+                }
+                pending.status = 'Completed';
+                if (pending.deadline) {
+                    timers.clearTimeout(pending.deadline);
+                }
+                attempt.request = { status: 'None' };
+                if (outcome.status !== 'Received') {
+                    abortRequest(pending);
+                }
+                callback(outcome);
+            }
+            function unavailable(reason) {
+                finish({ status: 'Unavailable', reasonCode: reason });
+            }
+            try {
+                if (typeof payload !== 'undefined') {
+                    body = JSON.stringify(payload);
+                    if (Buffer.byteLength(body, 'utf8') > 263168) {
+                        unavailable('RequestTooLarge');
+                        return;
+                    }
+                    options.headers['Content-Type'] = 'application/json';
+                    options.headers['Content-Length'] = Buffer.byteLength(body, 'utf8');
+                }
+                options.agent = false;
+                options.headers.Connection = 'close';
+                pending.client = http.request(options, function (response) {
+                    if (pending.status !== 'Pending' || !current(attempt)) {
+                        if (typeof response.destroy === 'function') {
+                            response.destroy();
+                        }
+                        return;
+                    }
+                    pending.response = response;
+                    var chunks = [];
+                    var bytes = 0;
+                    response.on('data', function (chunk) {
+                        if (pending.status !== 'Pending' || !current(attempt)) {
+                            return;
+                        }
+                        if (!Buffer.isBuffer(chunk) || bytes + chunk.length > 262144) {
+                            unavailable('ResponseTooLargeOrInvalid');
+                            return;
+                        }
+                        chunks.push(chunk);
+                        bytes += chunk.length;
+                    });
+                    response.on('error', function () { unavailable('ResponseFailed'); });
+                    response.on('aborted', function () { unavailable('ResponseAborted'); });
+                    response.on('close', function () { unavailable('ResponseClosed'); });
+                    response.on('end', function () {
+                        if (pending.status !== 'Pending' || !current(attempt)) {
+                            return;
+                        }
+                        var value;
+                        try {
+                            value = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8'));
+                        } catch (error) {
+                            unavailable('InvalidResponseJson');
+                            return;
+                        }
+                        if (!value || typeof value !== 'object' || Array.isArray(value) ||
+                                typeof response.statusCode !== 'number' || response.statusCode < 100 || response.statusCode > 599) {
+                            unavailable('InvalidResponse');
+                            return;
+                        }
+                        finish({ status: 'Received', statusCode: response.statusCode, body: value });
+                    });
+                });
+                pending.client.on('error', function () { unavailable('RequestFailed'); });
+                pending.deadline = timers.setTimeout(function () { unavailable('RequestTimedOut'); }, 3000);
+                pending.client.end(body);
+            } catch (error) {
+                unavailable('RequestFailed');
+            }
+        }
+
+        function brokerOptions(attempt, method, path) {
+            var headers = {};
+            if (attempt.status === 'Connected') {
+                headers.Authorization = 'Bearer ' + attempt.token;
+            }
+            return { hostname: attempt.pcAddress, port: 18766, method: method, path: path, headers: headers };
+        }
+
+        function schedulePoll(attempt) {
+            if (!current(attempt) || attempt.status !== 'Connected') {
+                return;
+            }
+            var scheduled = { status: 'Scheduled' };
+            attempt.wait = scheduled;
+            scheduled.timer = timers.setTimeout(function () {
+                if (!current(attempt) || attempt.wait !== scheduled) {
+                    return;
+                }
+                attempt.wait = { status: 'None' };
+                poll(attempt);
+            }, 500);
+        }
+
+        function validJob(job) {
+            if (!job || typeof job !== 'object' || Array.isArray(job) ||
+                    typeof job.id !== 'number' || !isFinite(job.id) || Math.floor(job.id) !== job.id ||
+                    job.id < 1 || job.id > 9007199254740991 || job.path !== SHELL_PATH ||
+                    ['GET', 'POST'].indexOf(job.method) < 0 || Buffer.byteLength(JSON.stringify(job), 'utf8') > 32768) {
+                return false;
+            }
+            return job.method === 'GET' ? job.body === null :
+                (job.body && typeof job.body === 'object' && !Array.isArray(job.body) &&
+                Buffer.byteLength(JSON.stringify(job.body), 'utf8') <= MAX_SHELL_BODY_BYTES);
+        }
+
+        function poll(attempt) {
+            jsonRequest(attempt, brokerOptions(attempt, 'GET', '/v1/jobs'), undefined, function (outcome) {
+                if (outcome.status !== 'Received' || outcome.statusCode !== 200) {
+                    fail(attempt, outcome.reasonCode || 'JobsRejected');
+                    return;
+                }
+                if (outcome.body.job === null) {
+                    schedulePoll(attempt);
+                    return;
+                }
+                var job = outcome.body.job;
+                if (!validJob(job)) {
+                    fail(attempt, 'InvalidJob');
+                    return;
+                }
+                if (Object.prototype.hasOwnProperty.call(attempt.seen, String(job.id))) {
+                    fail(attempt, 'DuplicateJob');
+                    return;
+                }
+                // Reserve before issuing the request: delivery errors must never replay an action.
+                attempt.seen[String(job.id)] = true;
+                jsonRequest(attempt, {
+                    hostname: '127.0.0.1', port: PORT, method: job.method, path: SHELL_PATH,
+                    headers: { Host: '127.0.0.1:' + PORT, Origin: 'http://127.0.0.1:8081' }
+                }, job.method === 'POST' ? job.body : undefined, function (forwarded) {
+                    if (forwarded.status !== 'Received') {
+                        fail(attempt, forwarded.reasonCode || 'ForwardFailed');
+                        return;
+                    }
+                    jsonRequest(attempt, brokerOptions(attempt, 'POST', '/v1/results'), {
+                        id: job.id, statusCode: forwarded.statusCode, body: forwarded.body
+                    }, function (acknowledgement) {
+                        if (acknowledgement.status !== 'Received' || acknowledgement.statusCode !== 200) {
+                            fail(attempt, acknowledgement.reasonCode || 'ResultRejected');
+                            return;
+                        }
+                        if (['Accepted', 'Expired', 'Duplicate'].indexOf(acknowledgement.body.status) < 0) {
+                            fail(attempt, 'InvalidResultAcknowledgement');
+                            return;
+                        }
+                        schedulePoll(attempt);
+                    });
+                });
+            });
+        }
+
+        function act(action) {
+            if (!action || typeof action !== 'object' || Array.isArray(action)) {
+                return { statusCode: 400, body: { error: 'InvalidPcLinkAction' } };
+            }
+            var keys = Object.keys(action).sort().join(',');
+            if (action.action === 'disable' && keys === 'action') {
+                var previous = state;
+                state = { status: 'Disabled' };
+                cancel(previous);
+                return { statusCode: 200, body: read() };
+            }
+            if (action.action !== 'enable' || keys !== 'action,pairCode,pcAddress' ||
+                    !privateAddress(action.pcAddress) || typeof action.pairCode !== 'string' || !/^[0-9]{8}$/.test(action.pairCode)) {
+                return { statusCode: 400, body: { error: 'InvalidPcLinkAction' } };
+            }
+            if (state.status === 'Pairing' || state.status === 'Connected') {
+                return { statusCode: 409, body: { error: 'PcLinkAlreadyActive' } };
+            }
+            var attempt = { status: 'Pairing', pcAddress: action.pcAddress, request: { status: 'None' },
+                wait: { status: 'None' }, expiry: { status: 'None' }, seen: Object.create(null) };
+            state = attempt;
+            jsonRequest(attempt, brokerOptions(attempt, 'POST', '/v1/pair'), {
+                code: action.pairCode, moduleId: MODULE_ID, schemaVersion: 1
+            }, function (paired) {
+                if (paired.status !== 'Received' || paired.statusCode !== 200) {
+                    fail(attempt, paired.reasonCode || 'PairingRejected');
+                    return;
+                }
+                var response = paired.body;
+                var expiry = typeof response.expiresAtUtc === 'string' ? Date.parse(response.expiresAtUtc) : NaN;
+                // Bound the local lifetime even when the two device clocks differ.
+                var remaining = Math.min(expiry - Date.now(), 900000);
+                if (response.moduleId !== 'tizenbrew-pc-link' || response.schemaVersion !== 1 ||
+                        typeof response.token !== 'string' || !/^[a-f0-9]{64}$/.test(response.token) ||
+                        !isFinite(remaining) || remaining <= 0 ||
+                        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(response.expiresAtUtc)) {
+                    fail(attempt, 'InvalidPairingResponse');
+                    return;
+                }
+                attempt.status = 'Connected';
+                attempt.token = response.token;
+                attempt.expiresAtUtc = response.expiresAtUtc;
+                attempt.expiry = { status: 'Scheduled', timer: timers.setTimeout(function () {
+                    fail(attempt, 'LinkExpired');
+                }, remaining) };
+                schedulePoll(attempt);
+            });
+            return { statusCode: 200, body: read() };
+        }
+
+        return { read: read, act: act };
+    }
+
+    var pcLink = createPcLink();
     var lifecycle = Object.freeze({ status: 'Starting' });
     var allowedOrigins = ['http://127.0.0.1:8081', 'http://localhost:8081'];
     var allowedHosts = ['127.0.0.1:' + PORT, 'localhost:' + PORT];
@@ -693,6 +986,86 @@
         response.setHeader('X-Content-Type-Options', 'nosniff');
         response.setHeader('Connection', 'close');
         response.end(body);
+    }
+
+    function pcLinkRequest(request, response) {
+        if (typeof request.headers.origin === 'undefined') {
+            reply(response, 403, '{"error":"OriginRequired"}');
+            return;
+        }
+        if (request.method === 'OPTIONS') {
+            var headers = request.headers['access-control-request-headers'];
+            if (request.headers['access-control-request-method'] !== 'POST' ||
+                    (typeof headers !== 'undefined' &&
+                    (typeof headers !== 'string' || headers.toLowerCase().trim() !== 'content-type'))) {
+                reply(response, 403, '{"error":"PreflightNotAllowed"}');
+                return;
+            }
+            response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+            response.setHeader('Access-Control-Max-Age', '300');
+            reply(response, 204, '');
+            return;
+        }
+        if (request.method === 'GET') {
+            reply(response, 200, JSON.stringify(pcLink.read()));
+            return;
+        }
+        if (request.method !== 'POST') {
+            response.setHeader('Allow', 'GET, POST, OPTIONS');
+            reply(response, 405, '{"error":"MethodNotAllowed"}');
+            return;
+        }
+        if (typeof request.headers['content-type'] !== 'string' ||
+                !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(request.headers['content-type'])) {
+            reply(response, 415, '{"error":"JsonRequired"}');
+            return;
+        }
+        var length = request.headers['content-length'];
+        if (typeof length !== 'undefined' &&
+                (typeof length !== 'string' || !/^\d+$/.test(length) || Number(length) > 2048)) {
+            reply(response, 413, '{"error":"BodyTooLargeOrInvalid"}');
+            return;
+        }
+        var bodyState = 'Reading';
+        var chunks = [];
+        var bytes = 0;
+        request.on('data', function (chunk) {
+            if (bodyState !== 'Reading') {
+                return;
+            }
+            if (!Buffer.isBuffer(chunk) || bytes + chunk.length > 2048) {
+                bodyState = 'Rejected';
+                chunks = [];
+                reply(response, 413, '{"error":"BodyTooLargeOrInvalid"}');
+                return;
+            }
+            chunks.push(chunk);
+            bytes += chunk.length;
+        });
+        request.on('aborted', function () { bodyState = 'Aborted'; chunks = []; });
+        request.on('error', function () {
+            if (bodyState === 'Reading') {
+                bodyState = 'Rejected';
+                chunks = [];
+                reply(response, 400, '{"error":"BodyReadFailed"}');
+            }
+        });
+        request.on('end', function () {
+            if (bodyState !== 'Reading') {
+                return;
+            }
+            bodyState = 'Complete';
+            var action;
+            try {
+                action = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8'));
+            } catch (error) {
+                reply(response, 400, '{"error":"InvalidJson"}');
+                return;
+            }
+            var outcome = pcLink.act(action);
+            reply(response, outcome.statusCode, JSON.stringify(outcome.body));
+        });
     }
 
     function shellRequest(request, response) {
@@ -800,6 +1173,10 @@
             }
             response.setHeader('Access-Control-Allow-Origin', origin);
             response.setHeader('Vary', 'Origin');
+        }
+        if (request.url === PC_LINK_PATH) {
+            pcLinkRequest(request, response);
+            return;
         }
         if (request.url === SHELL_PATH) {
             shellRequest(request, response);

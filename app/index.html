@@ -12,7 +12,7 @@
         p { margin: 10px 0 20px; line-height: 1.4; }
         .muted { color: #bbc8d0; }
         button { padding: 12px 28px; margin: 0 20px 16px 0; font: inherit; color: #101820; background: #b1ecdf; border: 3px solid transparent; border-radius: 6px; }
-        button:focus, textarea:focus, pre:focus { outline: 4px solid #ffffff; outline-offset: 4px; }
+        button:focus, textarea:focus, input:focus, pre:focus { outline: 4px solid #ffffff; outline-offset: 4px; }
         button:disabled { background: #738982; }
         #status { min-height: 34px; }
         table { width: 100%; border-collapse: collapse; margin: 16px 0; }
@@ -31,6 +31,7 @@
         label { display: block; margin: 12px 0 8px; }
         textarea { display: block; width: 100%; min-height: 140px; max-height: 300px; padding: 12px; margin: 0 0 16px; border: 2px solid #738982; border-radius: 6px; background: #192935; color: #f2f5f7; font: 22px monospace; resize: vertical; }
         textarea:disabled { color: #bbc8d0; }
+        input { padding: 10px 14px; margin: 0 20px 16px 0; border: 2px solid #738982; border-radius: 6px; background: #192935; color: #f2f5f7; font: 24px monospace; }
         .shell-stream { max-height: 300px; overflow: auto; }
         #shell-status { min-height: 34px; }
         section { border-top: 1px solid #3a4a55; border-bottom: 1px solid #3a4a55; margin: 12px 0 20px; }
@@ -39,7 +40,19 @@
 <body>
     <main>
         <h1>Runtime Identity</h1>
-        <p class="muted">The account and runtime used by TizenBrew's background service.</p>
+        <p class="muted">Version 0.4.0. The account and runtime used by TizenBrew's background service.</p>
+        <section aria-labelledby="pc-heading">
+            <h2 id="pc-heading">PC connection</h2>
+            <p class="note">Pair with your PC over the local network. The connection expires within fifteen minutes.</p>
+            <label for="pc-address">PC address</label>
+            <input id="pc-address" type="text" maxlength="15" inputmode="decimal" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="192.168.1.100">
+            <label for="pc-code">Eight-digit pairing code</label>
+            <input id="pc-code" type="password" maxlength="8" inputmode="numeric" autocomplete="off" aria-describedby="pc-detail">
+            <button id="pc-pair" type="button" disabled>Pair PC</button>
+            <button id="pc-disconnect" type="button" disabled>Disconnect PC</button>
+            <p id="pc-status" role="status" aria-live="polite" tabindex="-1">Waiting to read PC connection state.</p>
+            <p id="pc-detail" class="note"></p>
+        </section>
         <section aria-labelledby="shell-heading">
             <h2 id="shell-heading">Owner shell</h2>
             <p class="note">Runs as TizenBrew's account. Commands share one shell. Full-screen terminal programs are unsupported.</p>

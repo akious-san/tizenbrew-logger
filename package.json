@@ -1,6 +1,6 @@
 {
   "name": "tizenbrew-runtime-identity",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "A runtime identity report and explicit owner-account shell console in TizenBrew's Node service.",
   "appName": "Runtime Identity",
@@ -10,6 +10,9 @@
   "keys": [],
   "license": "UNLICENSED",
   "scripts": {
-    "test": "node tests/identity-check.contract.js"
+    "test": "node tests/identity-check.contract.js",
+    "test:pc-link": "node tests/pc-link.contract.js",
+    "test:pc-broker": "node tests/pc-broker.contract.mjs",
+    "test:pc-shell": "node tests/pc-shell.contract.mjs"
   }
 }
