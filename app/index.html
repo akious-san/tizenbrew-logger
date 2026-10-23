@@ -12,7 +12,7 @@
         p { margin: 10px 0 20px; line-height: 1.4; }
         .muted { color: #bbc8d0; }
         button { padding: 12px 28px; margin: 0 20px 16px 0; font: inherit; color: #101820; background: #b1ecdf; border: 3px solid transparent; border-radius: 6px; }
-        button:focus { outline: 4px solid #ffffff; outline-offset: 4px; }
+        button:focus, textarea:focus, pre:focus { outline: 4px solid #ffffff; outline-offset: 4px; }
         button:disabled { background: #738982; }
         #status { min-height: 34px; }
         table { width: 100%; border-collapse: collapse; margin: 16px 0; }
@@ -28,6 +28,11 @@
         h2 { margin: 16px 0 8px; font-size: 28px; }
         h3 { margin: 12px 0 6px; font-size: 22px; }
         pre { margin: 0 0 16px; padding: 12px; background: #192935; font: 20px monospace; white-space: pre-wrap; word-wrap: break-word; }
+        label { display: block; margin: 12px 0 8px; }
+        textarea { display: block; width: 100%; min-height: 140px; max-height: 300px; padding: 12px; margin: 0 0 16px; border: 2px solid #738982; border-radius: 6px; background: #192935; color: #f2f5f7; font: 22px monospace; resize: vertical; }
+        textarea:disabled { color: #bbc8d0; }
+        .shell-stream { max-height: 300px; overflow: auto; }
+        #shell-status { min-height: 34px; }
         section { border-top: 1px solid #3a4a55; border-bottom: 1px solid #3a4a55; margin: 12px 0 20px; }
     </style>
 </head>
@@ -35,6 +40,26 @@
     <main>
         <h1>Runtime Identity</h1>
         <p class="muted">The account and runtime used by TizenBrew's background service.</p>
+        <section aria-labelledby="shell-heading">
+            <h2 id="shell-heading">Owner shell</h2>
+            <p class="note">Runs as TizenBrew's account. Commands share one shell. Full-screen terminal programs are unsupported.</p>
+            <button id="shell-start" type="button" disabled>Start shell</button>
+            <button id="shell-stop" type="button" disabled>Stop shell</button>
+            <button id="shell-refresh" type="button">Refresh shell</button>
+            <p id="shell-status" role="status" aria-live="polite" tabindex="-1">Waiting to read shell state. Nothing starts automatically.</p>
+            <p id="shell-detail" class="note"></p>
+            <label for="shell-command">Command</label>
+            <textarea id="shell-command" rows="4" maxlength="4096" disabled autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" aria-describedby="shell-command-help"></textarea>
+            <button id="shell-send" type="button" disabled>Send command</button>
+            <p id="shell-command-help" class="note">Send runs the typed command. Enter adds a line; Ctrl+Enter sends. Back/Escape returns to controls. Down from Send opens output; arrows scroll it. Left/Right switch buttons or output streams.</p>
+            <h3>Standard output</h3>
+            <p id="shell-stdout-detail" class="note">Up to 16 KiB retained.</p>
+            <pre id="shell-stdout" class="shell-stream" tabindex="0" aria-label="Shell standard output">(not read)</pre>
+            <h3>Standard error</h3>
+            <p id="shell-stderr-detail" class="note">Up to 16 KiB retained.</p>
+            <pre id="shell-stderr" class="shell-stream" tabindex="0" aria-label="Shell standard error">(not read)</pre>
+            <p class="note">Idle expiry: five minutes without accepted input. Maximum session: fifteen minutes. Reads do not extend either deadline.</p>
+        </section>
         <button id="refresh" type="button">Refresh report</button>
         <button id="run-check" type="button" disabled>Run identity check</button>
         <section aria-labelledby="check-heading">

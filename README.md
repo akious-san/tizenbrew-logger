@@ -1,12 +1,26 @@
 # TizenBrew runtime identity
 
-A small TizenBrew application module that reports the runtime and identity of TizenBrew's Node service process. This is the first evidence-collection step toward choosing a compatible app-level command interface.
+A TizenBrew application module with a runtime identity report, a fixed identity check, and an optional owner-account shell console.
 
-Status: version 0.1.0's runtime report was observed working on the user's TV in a photograph: Node 4.4.3, ARM/Linux, UID 5001, GID 100, Tizen 3.0. Version 0.2.0 adds the authorized fixed identity command check. Its command check has not been run on the TV by the agent.
+Status: the user supplied photographs showing the runtime report and version 0.2.0's fixed `/usr/bin/id` check succeeding on the TV as owner (UID 5001, GID 100). Version 0.3.0 adds the owner-account shell; the shell has not been run on the TV during this implementation.
+
+## Owner shell contract (0.3.0)
+
+Version 0.3.0 adds a pipe-based shell console to the existing page and loopback service. An explicit Start shell action spawns `/bin/sh -s` with piped stdin/stdout/stderr and a separate POSIX process group. Submitted commands share this shell, including its working directory and variables. There is no pseudo-terminal: full-screen terminal programs, password prompts, and job-control shortcuts are not supported. Nothing starts on page load, report refresh, or TV boot.
+
+The existing service owns one shell session at a time. Its lifecycle is `NotStarted -> Running -> Stopping -> Closed`, with `Failed` for a start failure. A new session can start only after the previous shell closes. Stop and expiry request termination of the owned shell process group, with a direct child-handle fallback if the group request fails. A requested signal is not proof of termination. If both requests fail, the session stays Stopping and the user may retry Stop explicitly; a replacement cannot start. Session inactivity expires after five minutes without accepted command input; an absolute fifteen-minute lifetime also applies. These deadlines trigger termination requests, not a guarantee that a denied signal stopped a process. Reads do not prolong the session. Output retains the latest 16 KiB of raw bytes per stream and reports dropped-byte counts.
+
+`GET /v1/shell` reads state and obtains a random 32-byte hex capability token. Both reads and actions require the existing exact loopback Host and allowed Origin. `POST /v1/shell` accepts JSON with `token`, `action`, and `sessionId`; `input` additionally requires `sequence` and `command`. Actions are `start`, `input`, or `stop`. Input is at most 4096 UTF-8 bytes, cannot contain NUL, and is never submitted automatically. The request body is capped at 32768 raw bytes and must be `application/json`; browser preflight permits only that header. No LAN listener, remote connection, elevated identity, or startup persistence is added.
+
+The envelope contains `moduleId`, `schemaVersion: 1`, `shellId: owner-shell`, `token`, `settings`, `session`, and `outcome`. Settings contain `file: /bin/sh`, `args: [-s]`, `maxInputBytes: 4096`, `maxOutputBytesPerStream: 16384`, `idleTimeoutMs: 300000`, and `sessionTimeoutMs: 900000`. A session always includes integer `id`, explicit `status`, `nextInputSequence`, `inputStatus` (`Ready`, `Backpressured`, or `Closed`), bounded `stdout`/`stderr` objects (`bytes`, `text`, `droppedBytes`), explicit `exit`, and explicit `termination`. Start/completion timestamps appear only when observed. Initial session ID is zero. Each start attempt increments the ID; a repeat start for the immediately preceding ID reads the same new session. Stale session actions are rejected. Input sequence starts at one: identical replay of the most recent input is acknowledged without writing twice, while conflicting or out-of-order input is rejected.
+
+`outcome.status` is `Read`, `Started`, `Written`, `Stopped`, `Replay`, or `Rejected`; rejected actions include a bounded `reasonCode`. `Written` means input was submitted to the pipe, not that a command completed successfully. Backpressure blocks further input until drain. Domain rejections return the current envelope. Invalid transport requests return a bounded error response without consuming an action. Session statuses are `NotStarted`, `Running`, `Stopping`, `Closed`, and `Failed`. The existing exit and termination result shapes are reused; termination may also report `scope: ProcessGroup` or `Child`. Unknown or failed delivery is resolved by reading state, never by automatically resending a command. The session exposes `lastInput` as `None` or `Submitted` with its `sequence` and `command`, so a recovery read can identify the actual accepted command rather than assuming another client's input was ours. Only that one input is retained in memory for replay handling. After shell exit is observed, no later timer signals its former PID; up to three seconds are allowed to drain output before owned pipe handles are closed. Background jobs may outlive natural shell exit, and commands that create separate sessions/groups can outlive group termination. This console does not guarantee cleanup of every descendant.
+
+The UI provides Start shell, command input, Send command, Stop shell, and Refresh shell. It polls state every second only while a visible page has a Running/Stopping shell. Polling never sends commands. Leaving or hiding the page stops polling; the service deadlines remain in force. Commands and output are not saved to browser storage or written to a log by this module. No shell, command, test, or application JavaScript is run by the agent during implementation.
 
 ## Fixed identity check contract
 
-The existing service owns one additional lifecycle: `NotRun -> Running -> terminal result`. The only executable is `/usr/bin/id`, with an empty argument array and no shell interpreter. No executable, arguments, environment, working directory, or input can be supplied by an HTTP caller.
+The fixed identity route owns its original lifecycle: `NotRun -> Running -> terminal result`. That route executes only `/usr/bin/id`, with an empty argument array and no shell interpreter. Its HTTP callers cannot supply executable settings or command input. The separate shell route follows the owner-shell contract above.
 
 | Setting | Value |
 | --- | --- |
@@ -34,12 +48,12 @@ Checked against public release sources on 2026-10-22, after the user clarified t
 | --- | --- | --- |
 | TizenBrew Installer | `1.1.3` | Installs TV application packages; its repository installation path fetches the selected repository's latest release dynamically. |
 | TizenBrew TV app | `2.0.5` | The currently published app release and the pinned module-loader contract used by these sources. |
-| Diagnostic module | `0.2.0` | Adds the explicitly triggered fixed identity check; this version does not track the installer's number. |
+| Diagnostic module | `0.3.0` | Adds an explicit owner-account shell console; this version does not track the installer's number. |
 | TV platform baseline | Tizen `3.0`, Node `4.4.3` generation | The existing device record and compatibility baseline preserved by the module's syntax and API choices. |
 
 Using Installer 1.1.3 to install/update TizenBrew currently resolves to the 2.0.5 TV application release. That selection can change when the app publishes another release. The installer installs application packages; it does not update the TV's Tizen operating system. A TV OS update is not a prerequisite established by the inspected app manifest, which declares a minimum platform version of 3.0.
 
-The diagnostic uses the 2.0.5 loader contract. Version 0.1.0's snapshot was observed working on the TV; that does not validate the new subprocess check. The diagnostic remains a module loaded through TizenBrew's module manager. Its source ZIP is not a WGT/TPK package for the installer.
+The diagnostic uses the 2.0.5 loader contract. Version 0.1.0's snapshot and version 0.2.0's identity subprocess check were observed working in user-supplied TV photographs. Those results do not validate the new persistent shell. The module is loaded through TizenBrew's module manager. Its source ZIP is not a WGT/TPK package for the installer.
 
 Sources: [Installer 1.1.3](https://github.com/reisxd/TizenBrewInstaller/releases/tag/v1.1.3), [installer package-selection code](https://github.com/reisxd/TizenBrewInstaller/blob/v1.1.3/client/services/tizenbrew-installer-service/index.js#L228), [TizenBrew 2.0.5](https://github.com/reisxd/TizenBrew/releases/tag/v2.0.5), [app manifest](https://github.com/reisxd/TizenBrew/blob/v2.0.5/tizenbrew-app/TizenBrew/config.xml).
 
@@ -76,11 +90,11 @@ The snapshot does not collect environment variables, command-line arguments, fil
 
 ## Reuse and module lifecycle
 
-The existing TizenBrew service owns module loading. `package.json` reuses its `packageType`, `appPath`, and `serviceFile` contract. The existing `service.js` owns snapshot collection, the fixed check lifecycle, and their local transport. The page reuses one bounded JSON request adapter for both views. These sources use built-in Node modules only and ES5 syntax for the documented Node 4.4.3 generation. The service imports the built-in `timers` module explicitly, rather than assuming that the host VM injects timer globals.
+The existing TizenBrew service owns module loading. `package.json` reuses its `packageType`, `appPath`, and `serviceFile` contract. The existing `service.js` owns snapshot collection, the fixed check, the separate persistent shell lifecycle, and their local transport. Exit observation and process-start error classification are shared. The page reuses one bounded JSON request adapter across its views. These sources use built-in Node modules only and ES5 syntax for Node 4.4.3. Timers are imported explicitly, rather than assuming that the host VM injects timer globals. The persistent shell is a separate lifecycle inside the existing file because it owns repeated input, session IDs, backpressure, deadlines, and output tails; it is not another fixed one-shot check.
 
 TizenBrew's inspected loader evaluates `serviceFile` directly. It does not call a module's `onStart`, so this file initializes at top level. The supplied `require` belongs to the host; there are no relative service imports or npm dependencies. The module does not call `process.exit`, change the host's globals, or create its own Tizen service package.
 
-The module owns one HTTP listener bound explicitly to `127.0.0.1:18765`. `GET /v1/report` returns the snapshot; `GET /v1/id-check` reads the check; empty `POST /v1/id-check` starts its one permitted attempt. The service accepts the local endpoint's Host header and the inspected TizenBrew module origins, `http://127.0.0.1:8081` or `http://localhost:8081`. No LAN listener or arbitrary-command interface is created. Reads without an Origin header still need the local Host header; POST requires an allowed Origin.
+The module owns one HTTP listener bound explicitly to `127.0.0.1:18765`. `GET /v1/report` returns the snapshot; `GET /v1/id-check` reads the check; empty `POST /v1/id-check` starts its one permitted attempt. `GET/POST /v1/shell` manage the explicit shell session. The service accepts the local endpoint's Host header and the inspected TizenBrew module origins, `http://127.0.0.1:8081` or `http://localhost:8081`. No LAN listener is created. Snapshot/check reads without Origin still need the local Host header; every shell request and every POST requires an allowed Origin. The capability token is additional protection against unintended requests, not authentication between native processes or other trusted modules sharing that origin and account.
 
 The listener lifecycle is `Starting`, `Listening`, `Failed`, or `Closed`, with its state held by this module. A port conflict produces `Failed / PortInUse` in the service log; it never takes over or terminates an existing listener. The page validates the response's module identity and schema before displaying it. These checks identify the expected report format; they are not cryptographic authentication of a process.
 
@@ -89,21 +103,21 @@ The listener remains associated with TizenBrew's background service. Leaving the
 ## Files and delivery
 
 - `package.json`: TizenBrew module metadata; the npm `private` flag prevents accidental npm publication.
-- `service.js`: self-contained collector, fixed identity check, and loopback transport adapter.
-- `app/index.html` and `app/main.js`: display page, Refresh and Run identity check buttons, bounded requests, and explicit outcomes.
-- `tests/identity-check.contract.js`: synthetic contract cases with fake processes, sockets, and timers; never invokes a real subprocess.
+- `service.js`: self-contained collector, fixed identity check, persistent shell, and loopback transport adapter.
+- `app/index.html` and `app/main.js`: report and shell controls, bounded requests, and explicit outcomes.
+- `tests/identity-check.contract.js`: synthetic service contract cases with fake processes, sockets, timers, and capability tokens; never invokes a real subprocess.
 
 The folder and accompanying ZIP are source artifacts, not signed WGT installers. No build or dependency installation is needed for these sources. Opening `app/index.html` on the PC does not start the service or reproduce the TV runtime.
 
 The inspected TizenBrew loader obtains module metadata and service source through jsDelivr. The user's repository is `akious-san/tizenbrew-logger`; it must remain publicly readable for this delivery path. The package.json `private` flag only prevents npm publication and is independent of GitHub visibility.
 
-Version 0.2.0 uses the GitHub tag `v0.2.0` for a stable module reference.
+Version 0.3.0 uses the GitHub tag `v0.3.0` for a stable module reference. The TV fetches that tag rather than uncommitted files on the PC.
 
-In TizenBrew's Module Manager, remove the old module entry and add a GitHub module using `akious-san/tizenbrew-logger@v0.2.0` (the UI adds `gh/`). A new tag avoids reusing the previously fetched branch contents. Restart the TV fully before opening the new entry: TizenBrew can retain the old service instance and its loopback listener after merely leaving a page. There is no need to reinstall TizenBrew or update firmware for this module source change.
+In TizenBrew's Module Manager, remove the old module entry and add a GitHub module using `akious-san/tizenbrew-logger@v0.3.0` (the UI adds `gh/`). A new tag avoids reusing previously fetched branch contents. Restart the TV fully before opening the new entry: TizenBrew can retain the old service instance and loopback listener after merely leaving a page. There is no need to reinstall TizenBrew or update firmware for this module source change.
 
-Open Runtime Identity and choose Run identity check when you want to perform the one check. Refresh reads its existing result. Publishing the module does not execute the check; the agent has not run it on the TV.
+Open Runtime Identity. Choose Start shell, enter a command, then Send command. Each command is sent once to the same running shell. Stop shell requests session termination. Refresh shell reads state and output. For example, entering `pwd` asks the shell to print its working directory; entering `cd /tmp` and then `pwd` uses that directory in the same session. These are usage examples, not commands executed by the agent. Publishing the module does not start a shell.
 
-Use the remote's Left/Right buttons to move between the two enabled buttons; Up/Down remain available for scrolling the report.
+Use the remote's Left/Right buttons to move between enabled controls. Down from Send focuses standard output; arrows scroll inside it, Left/Right switch output streams, and Back/Escape returns to controls. New output follows the bottom while it is already in view; scrolling up keeps the reader's position. Up/Down otherwise remain available for scrolling the report.
 
 ## Expected display behavior
 
@@ -113,7 +127,7 @@ The inspected host serves application modules over local HTTP on port 8081, whic
 
 ## Validation record
 
-The earlier snapshot has user-supplied on-TV evidence. The new version's preparation uses source inspection and metadata/archive checks only. Synthetic tests are supplied but have not been executed; no real `/usr/bin/id` invocation, TV connection, or deployment is performed by the agent in this step. Do not interpret a prepared package as a passed command-execution or integration test.
+The earlier snapshot and fixed identity check have user-supplied on-TV evidence. This shell version uses static source review, diff/metadata/archive checks, and publication verification only. Forty synthetic service contract cases are supplied but have not been executed. No shell, command, application JavaScript, TV connection, or TV deployment is performed by the agent in this step. Publishing a package is not a passed shell integration test.
 
 ## Source references
 
@@ -123,5 +137,6 @@ The earlier snapshot has user-supplied on-TV evidence. The new version's prepara
 - [TizenBrew v2.0.5 module metadata loader](https://github.com/reisxd/TizenBrew/blob/v2.0.5/tizenbrew-app/TizenBrew/service-nextgen/service/utils/moduleLoader.js)
 - [Older TizenTube module manifest example](https://github.com/reisxd/TizenTube/blob/v2.0.1/package.json)
 - [Node 4.4.3 child-process API](https://nodejs.org/download/release/v4.4.3/docs/api/child_process.html)
+- [Node 4.4.3 stream write API](https://nodejs.org/download/release/v4.4.3/docs/api/stream.html#stream_writable_write_chunk_encoding_callback)
 
 These references describe inspected public sources. The installation record and the user's photo supply the separate device evidence; the public sources alone do not identify an installed version.

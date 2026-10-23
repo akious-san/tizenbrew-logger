@@ -3,8 +3,10 @@
 
     var REPORT_URL = 'http://127.0.0.1:18765/v1/report';
     var CHECK_URL = 'http://127.0.0.1:18765/v1/id-check';
+    var SHELL_URL = 'http://127.0.0.1:18765/v1/shell';
     var MAX_REPORT_BYTES = 16384;
     var MAX_CHECK_BYTES = 65536;
+    var MAX_SHELL_BYTES = 262144;
     var expectedFields = {
         'node.version': 'string',
         'node.platform': 'string',
@@ -31,6 +33,23 @@
     var stderr = document.getElementById('stderr');
     var view = { status: 'Idle' };
     var checkView = { status: 'Idle' };
+    var shellStart = document.getElementById('shell-start');
+    var shellCommand = document.getElementById('shell-command');
+    var shellSend = document.getElementById('shell-send');
+    var shellStop = document.getElementById('shell-stop');
+    var shellRefresh = document.getElementById('shell-refresh');
+    var shellStatus = document.getElementById('shell-status');
+    var shellDetail = document.getElementById('shell-detail');
+    var shellStdout = document.getElementById('shell-stdout');
+    var shellStderr = document.getElementById('shell-stderr');
+    var shellStdoutDetail = document.getElementById('shell-stdout-detail');
+    var shellStderrDetail = document.getElementById('shell-stderr-detail');
+    var shellView = { status: 'Idle' };
+    var shellSnapshot = { status: 'Unavailable' };
+    var shellPoll = { status: 'Idle' };
+    var shellInput = { status: 'None' };
+    var shellPage = { status: 'Active' };
+    var commandRevision = 0;
 
     function boundedString(value, maximum) {
         return typeof value === 'string' && value.length > 0 && value.length <= maximum;
@@ -73,8 +92,8 @@
             /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && !isNaN(Date.parse(value));
     }
 
-    // Both views use the same bounded JSON transport; neither GET starts a process.
-    function requestJson(method, url, maximum, callback) {
+    // Views share bounded JSON transport. Only shell actions supply a JSON body.
+    function requestJson(method, url, maximum, callback, payload) {
         var finished = false;
         function finishRequest(outcome) {
             if (!finished) {
@@ -118,12 +137,16 @@
             }
             finishRequest({ status: 'Received', value: value });
         };
-        request.onerror = function () { reject('The local service could not be reached. Choose Refresh report to read its state.'); };
+        request.onerror = function () { reject('The local service could not be reached.'); };
         request.ontimeout = function () { reject('The local service did not respond within three seconds.'); };
         request.onabort = function () { reject('The request ended before a response was received.'); };
         try {
-            // No request body, custom headers, or command arguments are accepted.
-            request.send();
+            if (typeof payload !== 'undefined') {
+                request.setRequestHeader('Content-Type', 'application/json');
+                request.send(JSON.stringify(payload));
+            } else {
+                request.send();
+            }
         } catch (error) {
             reject('This page could not contact its local service.');
         }
@@ -224,6 +247,335 @@
         return result.status !== 'Succeeded' ||
             (result.exit.status === 'Observed' && result.exit.kind === 'Code' && result.exit.value === 0 &&
             termination.status === 'NotRequested');
+    }
+
+    function validSequence(value) {
+        return validValue('integer', value) && value <= 9007199254740991;
+    }
+
+    function validReason(value) {
+        return boundedString(value, 64) && /^[A-Za-z][A-Za-z0-9]*$/.test(value);
+    }
+
+    function validShellStream(stream) {
+        return stream && validSequence(stream.bytes) && stream.bytes <= 16384 &&
+            typeof stream.text === 'string' && stream.text.length <= stream.bytes &&
+            validSequence(stream.droppedBytes);
+    }
+
+    function validShellTermination(termination) {
+        if (!termination || typeof termination !== 'object' ||
+                (own.call(termination, 'scope') &&
+                ['ProcessGroup', 'Child'].indexOf(termination.scope) < 0)) {
+            return false;
+        }
+        if (termination.status === 'NotRequested') {
+            return !own.call(termination, 'signal');
+        }
+        return ['Requested', 'RequestFailed'].indexOf(termination.status) >= 0 &&
+            ['SIGTERM', 'SIGKILL'].indexOf(termination.signal) >= 0;
+    }
+
+    function validShellCommand(command) {
+        return typeof command === 'string' && /\S/.test(command) &&
+            command.indexOf('\u0000') < 0 && responseWithinLimit(command, 4096);
+    }
+
+    function validLastInput(input, nextSequence) {
+        if (!input || typeof input !== 'object') {
+            return false;
+        }
+        if (input.status === 'None') {
+            return nextSequence === 1 && !own.call(input, 'sequence') && !own.call(input, 'command');
+        }
+        return input.status === 'Submitted' && validSequence(input.sequence) && input.sequence >= 1 &&
+            input.sequence === nextSequence - 1 && validShellCommand(input.command);
+    }
+
+    function validShell(envelope) {
+        if (!envelope || envelope.moduleId !== 'tizenbrew-runtime-identity' ||
+                envelope.schemaVersion !== 1 || envelope.shellId !== 'owner-shell' ||
+                typeof envelope.token !== 'string' || !/^[a-f0-9]{64}$/.test(envelope.token) ||
+                !envelope.settings || !envelope.session || !envelope.outcome) {
+            return false;
+        }
+        var settings = envelope.settings;
+        if (settings.file !== '/bin/sh' || !Array.isArray(settings.args) ||
+                settings.args.length !== 1 || settings.args[0] !== '-s' ||
+                settings.maxInputBytes !== 4096 || settings.maxOutputBytesPerStream !== 16384 ||
+                settings.idleTimeoutMs !== 300000 || settings.sessionTimeoutMs !== 900000) {
+            return false;
+        }
+        var session = envelope.session;
+        if (!validSequence(session.id) || !validSequence(session.nextInputSequence) ||
+                session.nextInputSequence < 1 ||
+                ['NotStarted', 'Running', 'Stopping', 'Closed', 'Failed'].indexOf(session.status) < 0 ||
+                ['Ready', 'Backpressured', 'Closed'].indexOf(session.inputStatus) < 0 ||
+                !validLastInput(session.lastInput, session.nextInputSequence) ||
+                !validShellStream(session.stdout) || !validShellStream(session.stderr) ||
+                !validExit(session.exit) || !validShellTermination(session.termination)) {
+            return false;
+        }
+        if ((own.call(session, 'startedAtUtc') && !validTimestamp(session.startedAtUtc)) ||
+                (own.call(session, 'completedAtUtc') && !validTimestamp(session.completedAtUtc)) ||
+                (own.call(session, 'reasonCode') && !validReason(session.reasonCode))) {
+            return false;
+        }
+        if (session.status === 'NotStarted' && (session.id !== 0 ||
+                own.call(session, 'startedAtUtc') || own.call(session, 'completedAtUtc'))) {
+            return false;
+        }
+        if (['Running', 'Stopping'].indexOf(session.status) >= 0 &&
+                (!validTimestamp(session.startedAtUtc) || own.call(session, 'completedAtUtc'))) {
+            return false;
+        }
+        if (['Closed', 'Failed'].indexOf(session.status) >= 0 &&
+                !validTimestamp(session.completedAtUtc)) {
+            return false;
+        }
+        var outcome = envelope.outcome;
+        return ['Read', 'Started', 'Written', 'Stopped', 'Replay', 'Rejected'].indexOf(outcome.status) >= 0 &&
+            (!own.call(outcome, 'reasonCode') || validReason(outcome.reasonCode)) &&
+            (outcome.status !== 'Rejected' || validReason(outcome.reasonCode));
+    }
+
+    function shellVisible() {
+        return shellPage.status === 'Active' && document.hidden !== true;
+    }
+
+    function clearShellPoll() {
+        if (shellPoll.status === 'Scheduled') {
+            clearTimeout(shellPoll.timer);
+        }
+        shellPoll = { status: 'Idle' };
+    }
+
+    function shellCanStop(session) {
+        return session.exit.status === 'NotObserved' && (session.status === 'Running' ||
+            (session.status === 'Stopping' && session.termination.status === 'RequestFailed'));
+    }
+
+    function updateShellControls() {
+        var ready = shellPage.status === 'Active' && shellView.status === 'Ready' && shellSnapshot.status === 'Observed';
+        var sessionStatus = shellSnapshot.status === 'Observed' ? shellSnapshot.value.session.status : 'Unknown';
+        shellStart.disabled = !ready || ['NotStarted', 'Closed', 'Failed'].indexOf(sessionStatus) < 0;
+        shellSend.disabled = !ready || sessionStatus !== 'Running' ||
+            shellSnapshot.value.session.inputStatus !== 'Ready' ||
+            shellInput.status === 'Awaiting' || !validShellCommand(shellCommand.value);
+        shellStop.disabled = !ready || !shellCanStop(shellSnapshot.value.session);
+        shellRefresh.disabled = shellView.status === 'Pending' || shellPage.status !== 'Active';
+        shellCommand.disabled = shellSnapshot.status !== 'Observed' || sessionStatus !== 'Running';
+    }
+
+    function scheduleShellRead() {
+        clearShellPoll();
+        if (!shellVisible() || shellView.status === 'Pending' || shellSnapshot.status !== 'Observed' ||
+                ['Running', 'Stopping'].indexOf(shellSnapshot.value.session.status) < 0) {
+            return;
+        }
+        var scheduled = { status: 'Scheduled' };
+        shellPoll = scheduled;
+        scheduled.timer = setTimeout(function () {
+            if (shellPoll !== scheduled) {
+                return;
+            }
+            shellPoll = { status: 'Idle' };
+            loadShell();
+        }, 1000);
+    }
+
+    function renderShellStream(element, text) {
+        var follow = element.scrollTop + element.clientHeight >= element.scrollHeight - 24;
+        var display = text || '(empty)';
+        if (element.textContent !== display) {
+            element.textContent = display;
+            if (follow) {
+                element.scrollTop = element.scrollHeight;
+            }
+        }
+    }
+
+    function renderShell(envelope, message) {
+        var session = envelope.session;
+        var detail = '';
+        if (session.status === 'Running') {
+            detail = session.inputStatus === 'Backpressured' ?
+                'Input is paused while the shell catches up. ' : 'Ready for a command. ';
+        } else if (session.status === 'NotStarted') {
+            detail = 'Choose Start shell to begin. ';
+        } else if (session.status === 'Stopping') {
+            detail = session.exit.status === 'Observed' ?
+                'The shell exited; collecting remaining output. ' : 'Waiting for the shell to close. ';
+        } else if (session.status === 'Failed') {
+            detail = 'The shell could not start. ';
+        } else if (session.status === 'Closed') {
+            detail = 'The session closed. Start shell opens a new session. ';
+        }
+        shellStatus.textContent = 'Shell: ' + session.status + '. ' + message;
+        if (session.reasonCode) {
+            detail += session.reasonCode + '. ';
+        }
+        if (session.exit.status === 'Observed') {
+            detail += 'Exit ' + session.exit.kind.toLowerCase() + ': ' + session.exit.value + '. ';
+        }
+        if (session.termination.status === 'Requested') {
+            detail += session.exit.status === 'Observed' ? 'A stop was requested. ' :
+                'A stop was requested; waiting to observe shell exit. ';
+        } else if (session.termination.status === 'RequestFailed') {
+            detail += 'The stop request failed. ' + (shellCanStop(session) ? 'Choose Stop shell to try stopping again. ' : '');
+        }
+        if (shellInput.status === 'Awaiting') {
+            detail += 'Previous input delivery remains unresolved; the typed command is retained. ';
+        }
+        shellDetail.textContent = detail;
+        renderShellStream(shellStdout, session.stdout.text);
+        renderShellStream(shellStderr, session.stderr.text);
+        shellStdoutDetail.textContent = session.stdout.bytes + ' retained bytes; ' + session.stdout.droppedBytes + ' dropped bytes.';
+        shellStderrDetail.textContent = session.stderr.bytes + ' retained bytes; ' + session.stderr.droppedBytes + ' dropped bytes.';
+        updateShellControls();
+    }
+
+    function reconcileShellInput(envelope) {
+        if (shellInput.status !== 'Awaiting') {
+            return '';
+        }
+        var input = shellInput;
+        var session = envelope.session;
+        if (session.id !== input.sessionId) {
+            shellInput = { status: 'None' };
+            return 'The session changed; the typed command was retained.';
+        }
+        if (session.reasonCode === 'InputWriteFailed' || envelope.outcome.reasonCode === 'InputWriteFailed') {
+            shellInput = { status: 'None' };
+            return 'Command write failed; the typed command was retained.';
+        }
+        if (envelope.outcome.status === 'Rejected') {
+            shellInput = { status: 'None' };
+            return 'The typed command was retained.';
+        }
+        if (session.lastInput.status === 'Submitted' && session.lastInput.sequence === input.sequence &&
+                session.lastInput.command === input.command) {
+            shellInput = { status: 'None' };
+            if (commandRevision === input.revision && shellCommand.value === input.command) {
+                shellCommand.value = '';
+                commandRevision += 1;
+            }
+            return 'Command received; completion is not confirmed.';
+        }
+        if (session.nextInputSequence === input.sequence) {
+            shellInput = { status: 'None' };
+            return 'Input was not accepted; the typed command was retained.';
+        }
+        if (session.nextInputSequence > input.sequence) {
+            shellInput = { status: 'None' };
+            return 'Another input was accepted. The typed command was retained; nothing was resent.';
+        }
+        return 'Input delivery could not be confirmed from this sequence; the typed command was retained.';
+    }
+
+    function shellOutcomeMessage(outcome, session) {
+        if (outcome.status === 'Rejected') {
+            return 'Action rejected (' + outcome.reasonCode + ').';
+        }
+        if (outcome.status === 'Started') {
+            if (session.status === 'Failed') {
+                return 'The shell could not start.';
+            }
+            return session.status === 'Running' ? 'Shell started. Commands share this session.' : 'Shell start attempted.';
+        }
+        if (outcome.status === 'Stopped') {
+            return 'Stop requested. Refresh reads the observed state.';
+        }
+        if (outcome.status === 'Written') {
+            return 'Command received; completion is not confirmed.';
+        }
+        if (outcome.status === 'Replay') {
+            return 'The service acknowledged an action already received.';
+        }
+        return '';
+    }
+
+    function loadShell(action) {
+        if (shellView.status === 'Pending' || !shellVisible()) {
+            return;
+        }
+        if (action && (shellView.status !== 'Ready' || shellSnapshot.status !== 'Observed')) {
+            return;
+        }
+        var payload;
+        if (action) {
+            var session = shellSnapshot.value.session;
+            if ((action === 'start' && ['NotStarted', 'Closed', 'Failed'].indexOf(session.status) < 0) ||
+                    (action === 'input' && session.status !== 'Running') ||
+                    (action === 'stop' && !shellCanStop(session))) {
+                return;
+            }
+            payload = { token: shellSnapshot.value.token, action: action, sessionId: session.id };
+            if (action === 'input') {
+                if (session.inputStatus !== 'Ready' || shellInput.status === 'Awaiting') {
+                    return;
+                }
+                var command = shellCommand.value;
+                if (!validShellCommand(command)) {
+                    shellStatus.textContent = 'Enter a nonblank command of at most 4096 UTF-8 bytes with no NUL characters.';
+                    return;
+                }
+                payload.sequence = session.nextInputSequence;
+                payload.command = command;
+                shellInput = {
+                    status: 'Awaiting', sessionId: session.id, sequence: payload.sequence,
+                    command: command, revision: commandRevision
+                };
+            }
+        }
+        clearShellPoll();
+        var pending = { status: 'Pending', action: action || 'read', focus: document.activeElement };
+        shellView = pending;
+        updateShellControls();
+        if (action) {
+            shellStatus.textContent = action === 'input' ? 'Sending command...' :
+                (action === 'start' ? 'Starting shell...' : 'Requesting stop...');
+        }
+        requestJson(action ? 'POST' : 'GET', SHELL_URL, MAX_SHELL_BYTES, function (outcome) {
+            if (shellView !== pending) {
+                return;
+            }
+            if (outcome.status !== 'Received' || !validShell(outcome.value)) {
+                shellView = { status: 'Unavailable' };
+                shellStatus.textContent = 'Shell state unavailable. ' +
+                    (outcome.message || 'Its identity or format did not match this module.');
+                shellDetail.textContent = action ?
+                    'Delivery is unknown. Refresh shell reads state; no action will be retried automatically.' :
+                    'Refresh shell reads state. Existing output is the last observed snapshot.';
+                updateShellControls();
+                if (shellVisible() && (pending.focus === shellStart || pending.focus === shellSend || pending.focus === shellStop ||
+                        (pending.focus === shellStatus && document.activeElement === shellStatus))) {
+                    shellRefresh.focus();
+                }
+                scheduleShellRead();
+                return;
+            }
+            var envelope = outcome.value;
+            shellSnapshot = { status: 'Observed', value: envelope };
+            shellView = { status: 'Ready' };
+            var inputMessage = reconcileShellInput(envelope);
+            renderShell(envelope, inputMessage && envelope.outcome.status === 'Rejected' ?
+                shellOutcomeMessage(envelope.outcome, envelope.session) + ' ' + inputMessage :
+                (inputMessage || shellOutcomeMessage(envelope.outcome, envelope.session)));
+            if (shellVisible() && action && (pending.focus === shellStart || pending.focus === shellSend) && !shellCommand.disabled) {
+                shellCommand.focus();
+            } else if (shellVisible() && action && pending.focus === shellStop) {
+                shellRefresh.focus();
+            } else if (shellVisible() && ((action && pending.focus === shellStart) ||
+                    (!action && pending.focus === shellStatus && document.activeElement === shellStatus))) {
+                if (!shellStart.disabled) {
+                    shellStart.focus();
+                } else {
+                    shellRefresh.focus();
+                }
+            }
+            scheduleShellRead();
+        }, payload);
     }
 
     function renderCheck(result) {
@@ -370,18 +722,108 @@
             loadCheck('POST', 2);
         }
     });
+    shellStart.addEventListener('click', function () { loadShell('start'); });
+    shellSend.addEventListener('click', function () { loadShell('input'); });
+    shellStop.addEventListener('click', function () { loadShell('stop'); });
+    shellRefresh.addEventListener('click', function () { loadShell(); });
+    shellCommand.addEventListener('input', function () {
+        commandRevision += 1;
+        updateShellControls();
+    });
     document.addEventListener('keydown', function (event) {
         var code = event.keyCode;
-        if ((code !== 37 && code !== 39) || (document.activeElement !== refresh && document.activeElement !== runCheck)) {
+        var active = document.activeElement;
+        if (active === shellStdout || active === shellStderr) {
+            var outputTarget;
+            if (code === 37 || code === 39) {
+                outputTarget = active === shellStdout ? shellStderr : shellStdout;
+            } else if (code === 38 && active.scrollTop <= 0) {
+                outputTarget = active === shellStderr ? shellStdout : (!shellSend.disabled ? shellSend : shellRefresh);
+            } else if (code === 40 && active === shellStdout &&
+                    active.scrollTop + active.clientHeight >= active.scrollHeight - 1) {
+                outputTarget = shellStderr;
+            } else if (code === 27 || code === 461 || code === 10009) {
+                outputTarget = !shellSend.disabled ? shellSend : shellRefresh;
+            }
+            if (outputTarget && !outputTarget.disabled) {
+                event.preventDefault();
+                event.stopPropagation();
+                outputTarget.focus();
+            }
             return;
         }
-        var target = document.activeElement === refresh ? runCheck : refresh;
-        if (!target.disabled) {
+        if (active === shellCommand) {
+            if (code === 13 && event.ctrlKey) {
+                event.preventDefault();
+                if (event.repeat !== true && !shellSend.disabled) {
+                    loadShell('input');
+                }
+            } else if (code === 27 || code === 461 || code === 10009) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!shellSend.disabled) {
+                    shellSend.focus();
+                } else if (!shellStop.disabled) {
+                    shellStop.focus();
+                } else if (!shellRefresh.disabled) {
+                    shellRefresh.focus();
+                }
+            }
+            // Ordinary Enter and arrows belong to the editor, including vertical scroll.
+            return;
+        }
+        var controls = [shellStart, shellStop, shellRefresh, shellSend, shellStdout, shellStderr, refresh, runCheck];
+        var index = controls.indexOf(active);
+        if (index < 0) {
+            return;
+        }
+        if (code === 40 && active === shellSend) {
             event.preventDefault();
-            target.focus();
+            shellStdout.focus();
+            return;
+        }
+        if (((code === 40 && (active === shellStart || active === shellStop || active === shellRefresh)) ||
+                (code === 38 && active === shellSend)) && !shellCommand.disabled) {
+            event.preventDefault();
+            shellCommand.focus();
+            return;
+        }
+        if (code !== 37 && code !== 39) {
+            // Up/Down otherwise retain normal page and output scrolling.
+            return;
+        }
+        var direction = code === 37 ? -1 : 1;
+        for (var distance = 1; distance < controls.length; distance += 1) {
+            var target = controls[(index + direction * distance + controls.length) % controls.length];
+            if (!target.disabled) {
+                event.preventDefault();
+                target.focus();
+                return;
+            }
+        }
+    });
+    function leaveShellPage() {
+        shellPage = { status: 'Left' };
+        clearShellPoll();
+        // Keep the pending request owned until completion; returning cannot overlap it with another request.
+        updateShellControls();
+    }
+    window.addEventListener('pagehide', leaveShellPage);
+    window.addEventListener('beforeunload', leaveShellPage);
+    window.addEventListener('pageshow', function () {
+        if (shellPage.status === 'Left') {
+            shellPage = { status: 'Active' };
+            loadShell();
+        }
+    });
+    document.addEventListener('visibilitychange', function () {
+        clearShellPoll();
+        if (shellVisible()) {
+            loadShell();
         }
     });
     loadReport();
     loadCheck('GET', 0);
-    refresh.focus();
+    shellStatus.focus();
+    loadShell();
 }());
